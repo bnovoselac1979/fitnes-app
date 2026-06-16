@@ -1,12 +1,12 @@
 # streamlit_app_fitnes_gsheets.py
 # Fitnes klub aplikacija preko Google Sheets baze
-# Radi na Streamlit Cloud-u uz gspread + Streamlit secrets.
+# V4: testiranje svih vezbi + glavni 5/3/1 + asistencije po cilju + korekcija po dnevniku
 
 from __future__ import annotations
 
 import re
 from datetime import datetime, date
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 
 import gspread
 import pandas as pd
@@ -14,52 +14,56 @@ import streamlit as st
 from google.oauth2.service_account import Credentials
 
 # ------------------------------------------------------------
-# 1) OSNOVNA PODEŠAVANJA
+# 1) OSNOVNA PODESAVANJA
 # ------------------------------------------------------------
 
 APP_TITLE = "Fitnes klub — 5/3/1 + RIR"
 
 SHEET_VEZBACI = "VEZBACI"
 SHEET_BAZA_VEZBI = "BAZA_VEZBI"
-SHEET_TEST_INPUT = "UNOS_TESTOVA"   # app upisuje testove ovde
-SHEET_TEST_CALC = "TESTOVI"         # može ostati kao obračunski/pregledni list u Google Sheets
+SHEET_PODESAVANJA = "PODESAVANJA"
+SHEET_TEST_INPUT = "UNOS_TESTOVA"
 SHEET_DNEVNIK = "DNEVNIK_UNOS"
 SHEET_PLAN = "A4_MESEC_KOMPAKT"
 
-# Brojevi redova gde su zaglavlja u Google Sheet-u.
-# Ako kasnije pojednostaviš Google Sheet pa svuda zaglavlja budu u prvom redu,
-# ovde samo promeni vrednosti na 1.
 HEADER_ROWS = {
     SHEET_VEZBACI: 2,
     SHEET_BAZA_VEZBI: 2,
     SHEET_TEST_INPUT: 2,
-    SHEET_TEST_CALC: 3,
     SHEET_DNEVNIK: 3,
     SHEET_PLAN: 4,
 }
 
-REQUIRED_VEZBACI_COLS = [
-    "ID", "Ime i Prezime", "Aktivan", "Email", "Sifra", "Poruka_Blokada"
-]
-
-REQUIRED_TEST_COLS = [
-    "Datum", "Email", "Naziv vežbe", "Kilaža (kg)", "Broj ponavljanja",
-    "Procena 1RM", "ID (auto)", "Ime (auto)", "Napomena"
-]
-
-REQUIRED_DNEVNIK_COLS = [
-    "Email", "Timestamp", "Datum", "ID", "Ime", "Nedelja", "Trening", "Vežba",
-    "Plan kg", "Plan ser.", "Plan reps", "Urađeno kg", "Urađeno ser.",
-    "Urađeno reps", "RIR stvarni", "Status", "Napomena", "Volumen (kg)"
-]
+REQUIRED_VEZBACI_COLS = ["ID", "Ime i Prezime", "Aktivan", "Email", "Sifra", "Poruka_Blokada"]
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
 ]
 
+ROUND_KG_STEP_DEFAULT = 2.5
+
+DEFAULT_GOAL_SETTINGS = {
+    "Snaga": {"TM %": 0.90, "RIR Cilj": 3, "Serije+": 0, "Kg Faktor": 1.00, "RIR Asist.": 3, "Zona Asist.": "5-10"},
+    "Hipertrofija": {"TM %": 0.875, "RIR Cilj": 2, "Serije+": 1, "Kg Faktor": 0.97, "RIR Asist.": 2, "Zona Asist.": "10-20"},
+    "Snaga+Hipertrofija": {"TM %": 0.90, "RIR Cilj": 2, "Serije+": 0, "Kg Faktor": 1.00, "RIR Asist.": 2, "Zona Asist.": "10-20"},
+    "Rekompozicija": {"TM %": 0.85, "RIR Cilj": 3, "Serije+": 0, "Kg Faktor": 0.97, "RIR Asist.": 3, "Zona Asist.": "10-20"},
+    "Sportista": {"TM %": 0.85, "RIR Cilj": 4, "Serije+": -1, "Kg Faktor": 0.95, "RIR Asist.": 4, "Zona Asist.": "5-10"},
+    "Početnik": {"TM %": 0.85, "RIR Cilj": 4, "Serije+": -1, "Kg Faktor": 0.95, "RIR Asist.": 4, "Zona Asist.": "10-20"},
+}
+
+DEFAULT_531_WEEKS = {
+    1: [(0.65, "5"), (0.75, "5"), (0.85, "5+")],
+    2: [(0.70, "3"), (0.80, "3"), (0.90, "3+")],
+    3: [(0.75, "5"), (0.85, "3"), (0.95, "1+")],
+    4: [(0.40, "5"), (0.50, "5"), (0.60, "5")],
+}
+
+ASSIST_WEEK_SETS = {1: "2", 2: "2", 3: "3", 4: "1-2"}
+ASSIST_WEEK_FACTOR = {1: 1.00, 2: 1.00, 3: 0.98, 4: 0.85}
+
 # ------------------------------------------------------------
-# 2) POMOĆNE FUNKCIJE
+# 2) POMOCNE FUNKCIJE
 # ------------------------------------------------------------
 
 def normalize_text(x) -> str:
@@ -78,15 +82,31 @@ def normalize_email(x) -> str:
 
 
 def normalize_sifra(x) -> str:
-    # Google Sheets nekad broj pročita kao 3069.0 ili 3069
     s = normalize_text(x)
     if s.endswith(".0"):
         s = s[:-2]
     return s
 
 
+def to_float(x, default: float = 0.0) -> float:
+    s = normalize_text(x).replace(",", ".")
+    if not s:
+        return default
+    try:
+        return float(s)
+    except Exception:
+        m = re.search(r"-?\d+(?:\.\d+)?", s)
+        return float(m.group(0)) if m else default
+
+
+def to_int(x, default: int = 0) -> int:
+    try:
+        return int(float(str(x).replace(",", ".")))
+    except Exception:
+        return default
+
+
 def estimate_1rm(kg: float, reps: int) -> float:
-    """Epley formula: kg * (1 + reps/30)."""
     kg = float(kg or 0)
     reps = int(reps or 1)
     if reps <= 1:
@@ -94,17 +114,32 @@ def estimate_1rm(kg: float, reps: int) -> float:
     return round(kg * (1 + reps / 30), 1)
 
 
-def extract_first_number(value) -> Optional[float]:
-    """Iz teksta tipa '80×5 / 90×3' uzima prvi broj kao plan kg."""
-    if value is None:
-        return None
-    text = str(value).replace(",", ".")
-    match = re.search(r"(\d+(?:\.\d+)?)", text)
-    return float(match.group(1)) if match else None
+def round_to_step(value: float, step: float = ROUND_KG_STEP_DEFAULT) -> float:
+    if not value:
+        return 0.0
+    return round(round(float(value) / step) * step, 2)
+
+
+def format_kg(x: Any) -> str:
+    if x is None or x == "":
+        return ""
+    val = to_float(x, 0)
+    if val == int(val):
+        return str(int(val))
+    return str(val).replace(".", ",")
+
+
+def parse_range(value: Any, fallback: Tuple[int, int] = (10, 15)) -> Tuple[int, int]:
+    text = normalize_text(value)
+    nums = [int(n) for n in re.findall(r"\d+", text)]
+    if len(nums) >= 2:
+        return nums[0], nums[1]
+    if len(nums) == 1:
+        return nums[0], nums[0]
+    return fallback
 
 
 def to_sheet_value(value):
-    """Pretvara Python vrednosti u format koji Google Sheets lepo prima."""
     if value is None:
         return ""
     if isinstance(value, (datetime, pd.Timestamp)):
@@ -123,27 +158,11 @@ def to_sheet_value(value):
 # ------------------------------------------------------------
 
 def _service_account_info() -> Dict[str, str]:
-    """
-    Podržava dva načina za secrets:
-    1) preporučeno u ovom projektu:
-       [gcp_service_account]
-       type = "service_account"
-       ...
-       [gsheets]
-       spreadsheet_url = "..."
-
-    2) Streamlit/GSheetsConnection stil:
-       [connections.gsheets]
-       spreadsheet = "..."
-       type = "service_account"
-       ...
-    """
     if "gcp_service_account" in st.secrets:
         return dict(st.secrets["gcp_service_account"])
 
     if "connections" in st.secrets and "gsheets" in st.secrets["connections"]:
         conn_secret = dict(st.secrets["connections"]["gsheets"])
-        # uklanjamo polja koja nisu deo JSON ključa
         conn_secret.pop("spreadsheet", None)
         conn_secret.pop("worksheet", None)
         return conn_secret
@@ -168,11 +187,8 @@ def _spreadsheet_url() -> str:
 @st.cache_resource(show_spinner=False)
 def get_spreadsheet():
     info = _service_account_info()
-
-    # Privatni ključ u TOML-u često mora da ima \n; ovde ga vraćamo u pravi oblik.
     if "private_key" in info:
         info["private_key"] = info["private_key"].replace("\\n", "\n")
-
     credentials = Credentials.from_service_account_info(info, scopes=SCOPES)
     client = gspread.authorize(credentials)
     return client.open_by_url(_spreadsheet_url())
@@ -189,7 +205,6 @@ def get_ws(sheet_name: str):
 
 @st.cache_data(ttl=10, show_spinner=False)
 def read_sheet(sheet_name: str) -> pd.DataFrame:
-    """Čita list iz Google Sheets-a, uzimajući u obzir red zaglavlja."""
     ws = get_ws(sheet_name)
     values = ws.get_all_values()
     header_row = HEADER_ROWS.get(sheet_name, 1)
@@ -199,12 +214,7 @@ def read_sheet(sheet_name: str) -> pd.DataFrame:
 
     headers = [str(h).strip() for h in values[header_row - 1]]
     data_rows = values[header_row:]
-
-    # ukloni potpuno prazne redove
     data_rows = [r for r in data_rows if any(str(c).strip() for c in r)]
-
-    if not headers:
-        return pd.DataFrame()
 
     width = len(headers)
     normalized_rows = []
@@ -238,30 +248,73 @@ def clear_caches() -> None:
 def get_headers(sheet_name: str) -> List[str]:
     ws = get_ws(sheet_name)
     header_row = HEADER_ROWS.get(sheet_name, 1)
-    headers = ws.row_values(header_row)
-    return [str(h).strip() for h in headers]
+    return [str(h).strip() for h in ws.row_values(header_row)]
 
 
 def append_rows_to_sheet(sheet_name: str, rows: List[Dict[str, object]]) -> None:
-    """Dodaje redove u Google Sheets po imenima kolona iz header reda."""
     if not rows:
         return
-
     ws = get_ws(sheet_name)
     headers = get_headers(sheet_name)
     if not headers:
         st.error(f"List {sheet_name} nema definisana zaglavlja.")
         st.stop()
-
-    prepared_rows = []
-    for row in rows:
-        prepared_rows.append([to_sheet_value(row.get(h, "")) for h in headers])
-
+    prepared_rows = [[to_sheet_value(row.get(h, "")) for h in headers] for row in rows]
     ws.append_rows(prepared_rows, value_input_option="USER_ENTERED")
     clear_caches()
 
 # ------------------------------------------------------------
-# 4) LOGOVANJE I PAYWALL
+# 4) PODESAVANJA TRENINGA
+# ------------------------------------------------------------
+
+@st.cache_data(ttl=30, show_spinner=False)
+def load_training_settings() -> Dict[str, Any]:
+    settings = {
+        "round_step": ROUND_KG_STEP_DEFAULT,
+        "goals": DEFAULT_GOAL_SETTINGS.copy(),
+        "weeks_531": DEFAULT_531_WEEKS.copy(),
+    }
+    try:
+        ws = get_ws(SHEET_PODESAVANJA)
+        values = ws.get_all_values()
+        # B2 je korak za zaokruzivanje kg u nasem Excelu
+        if len(values) >= 2 and len(values[1]) >= 2:
+            settings["round_step"] = to_float(values[1][1], ROUND_KG_STEP_DEFAULT) or ROUND_KG_STEP_DEFAULT
+
+        # Ciljevi: red 4 header, redovi 5-10 podaci
+        if len(values) >= 5:
+            headers = [normalize_text(x) for x in values[3]]
+            goal_rows = values[4:10]
+            parsed_goals = {}
+            for r in goal_rows:
+                if not r or not normalize_text(r[0]):
+                    continue
+                row = {headers[i]: r[i] if i < len(r) else "" for i in range(len(headers))}
+                goal_name = normalize_text(row.get("Cilj"))
+                if goal_name:
+                    parsed_goals[goal_name] = {
+                        "TM %": to_float(row.get("TM %"), DEFAULT_GOAL_SETTINGS.get(goal_name, {}).get("TM %", 0.9)),
+                        "RIR Cilj": to_int(row.get("RIR Cilj"), DEFAULT_GOAL_SETTINGS.get(goal_name, {}).get("RIR Cilj", 3)),
+                        "Serije+": to_int(row.get("Serije+"), DEFAULT_GOAL_SETTINGS.get(goal_name, {}).get("Serije+", 0)),
+                        "Kg Faktor": to_float(row.get("Kg Faktor"), DEFAULT_GOAL_SETTINGS.get(goal_name, {}).get("Kg Faktor", 1.0)),
+                        "RIR Asist.": to_int(row.get("RIR Asist."), DEFAULT_GOAL_SETTINGS.get(goal_name, {}).get("RIR Asist.", 3)),
+                        "Zona Asist.": normalize_text(row.get("Zona Asist.")) or DEFAULT_GOAL_SETTINGS.get(goal_name, {}).get("Zona Asist.", "10-15"),
+                    }
+            if parsed_goals:
+                settings["goals"] = {**DEFAULT_GOAL_SETTINGS, **parsed_goals}
+    except Exception:
+        pass
+    return settings
+
+
+def get_goal_settings(goal: str) -> Dict[str, Any]:
+    settings = load_training_settings()
+    goals = settings["goals"]
+    goal = normalize_text(goal)
+    return goals.get(goal) or goals.get("Snaga+Hipertrofija") or DEFAULT_GOAL_SETTINGS["Snaga+Hipertrofija"]
+
+# ------------------------------------------------------------
+# 5) LOGOVANJE I PAYWALL
 # ------------------------------------------------------------
 
 def get_user_by_login(email: str, sifra: str, vezbaci: pd.DataFrame) -> Optional[pd.Series]:
@@ -272,11 +325,9 @@ def get_user_by_login(email: str, sifra: str, vezbaci: pd.DataFrame) -> Optional
 
     email_norm = normalize_email(email)
     sifra_norm = normalize_sifra(sifra)
-
     df = vezbaci.copy()
     df["__email"] = df["Email"].apply(normalize_email)
     df["__sifra"] = df["Sifra"].apply(normalize_sifra)
-
     match = df[(df["__email"] == email_norm) & (df["__sifra"] == sifra_norm)]
     if match.empty:
         return None
@@ -287,16 +338,11 @@ def show_login_screen() -> None:
     st.title(APP_TITLE)
     st.subheader("Prijava vežbača")
     st.info("Unesite email i šifru iz registra vežbača.")
-
     data = load_core_data()
     vezbaci = data["vezbaci"]
-
-    with st.form("login_form"):
-        email = st.text_input("Email", placeholder="npr. ana@email.com")
-        sifra = st.text_input("Šifra", type="password", placeholder="4 broja")
-        submitted = st.form_submit_button("Uđi u aplikaciju")
-
-    if submitted:
+    email = st.text_input("Email", placeholder="npr. ana@email.com", key="login_email")
+    sifra = st.text_input("Šifra", type="password", placeholder="4 broja", key="login_sifra")
+    if st.button("Uđi u aplikaciju", type="primary", use_container_width=True):
         user = get_user_by_login(email, sifra, vezbaci)
         if user is None:
             st.error("Pogrešan email ili šifra.")
@@ -324,8 +370,28 @@ def enforce_paywall(user: Dict[str, object]) -> None:
         st.stop()
 
 # ------------------------------------------------------------
-# 5) TESTOVI
+# 6) VEZBE, TESTOVI I PLAN
 # ------------------------------------------------------------
+
+def exercise_column_name(vezbe: pd.DataFrame) -> str:
+    for possible in ["Vežba", "Naziv vežbe", "Vezba", "Naziv"]:
+        if possible in vezbe.columns:
+            return possible
+    st.error("U listu BAZA_VEZBI ne nalazim kolonu sa nazivom vežbe. Očekujem 'Vežba' ili 'Naziv vežbe'.")
+    st.stop()
+
+
+def get_exercise_meta(vezbe: pd.DataFrame, exercise: str) -> Dict[str, Any]:
+    if vezbe.empty:
+        return {}
+    col = exercise_column_name(vezbe)
+    df = vezbe.copy()
+    df["__ex"] = df[col].apply(lambda x: normalize_text(x).lower())
+    m = df[df["__ex"] == normalize_text(exercise).lower()]
+    if m.empty:
+        return {}
+    return m.iloc[0].to_dict()
+
 
 def user_has_tests(email: str, testovi_unos: pd.DataFrame) -> bool:
     if testovi_unos.empty or "Email" not in testovi_unos.columns:
@@ -335,33 +401,99 @@ def user_has_tests(email: str, testovi_unos: pd.DataFrame) -> bool:
     return (df["__email"] == normalize_email(email)).any()
 
 
-def _exercise_column_name(vezbe: pd.DataFrame) -> str:
-    for possible in ["Vežba", "Naziv vežbe", "Vezba", "Naziv"]:
-        if possible in vezbe.columns:
-            return possible
-    st.error("U listu BAZA_VEZBI ne nalazim kolonu sa nazivom vežbe. Očekujem 'Vežba' ili 'Naziv vežbe'.")
-    st.stop()
+def latest_test_for(email: str, exercise: str, testovi_unos: pd.DataFrame) -> Optional[Dict[str, Any]]:
+    required = ["Email", "Naziv vežbe", "Procena 1RM"]
+    if testovi_unos.empty or any(c not in testovi_unos.columns for c in required):
+        return None
+    df = testovi_unos.copy()
+    df["__email"] = df["Email"].apply(normalize_email)
+    df["__ex"] = df["Naziv vežbe"].apply(lambda x: normalize_text(x).lower())
+    df = df[(df["__email"] == normalize_email(email)) & (df["__ex"] == normalize_text(exercise).lower())]
+    if df.empty:
+        return None
+    if "Timestamp" in df.columns:
+        sort_col = "Timestamp"
+    elif "Datum" in df.columns:
+        sort_col = "Datum"
+    else:
+        sort_col = None
+    if sort_col:
+        df["__date"] = pd.to_datetime(df[sort_col], errors="coerce")
+        df = df.sort_values("__date")
+    row = df.iloc[-1].to_dict()
+    one_rm = to_float(row.get("Procena 1RM"), 0)
+    if one_rm <= 0:
+        kg = to_float(row.get("Kilaža (kg)"), 0)
+        reps = to_int(row.get("Broj ponavljanja"), 1)
+        one_rm = estimate_1rm(kg, reps)
+    row["__1rm"] = one_rm
+    return row if one_rm > 0 else None
+
+
+def parse_assistants(text: str) -> List[str]:
+    text = normalize_text(text)
+    if not text:
+        return []
+    parts = re.split(r"\s*/\s*|\s*;\s*|\s*,\s*", text)
+    return [p.strip() for p in parts if p.strip()]
+
+
+def all_plan_exercises(plan: pd.DataFrame) -> List[str]:
+    out: List[str] = []
+    if plan.empty:
+        return out
+    for _, r in plan.iterrows():
+        main = normalize_text(r.get("Glavna vežba"))
+        if main:
+            out.append(main)
+        for a in parse_assistants(r.get("Asistencije — skraćeno", "")):
+            out.append(a)
+    # zadrzi redosled, ukloni duplikate
+    seen = set()
+    unique = []
+    for x in out:
+        key = x.lower()
+        if key not in seen:
+            unique.append(x)
+            seen.add(key)
+    return unique
+
+
+def missing_tests_for_user(email: str, exercises: List[str], testovi: pd.DataFrame) -> List[str]:
+    missing = []
+    for ex in exercises:
+        if latest_test_for(email, ex, testovi) is None:
+            missing.append(ex)
+    return missing
 
 
 def show_initial_tests_screen(user: Dict[str, object]) -> None:
-    st.header("Početni testovi")
-    st.write("Unesite kilažu i broj ponavljanja. Aplikacija automatski računa procenjeni 1RM.")
+    st.header("Testiranje vežbi")
+    st.write("Za svaku vežbu unosi se kilaža i broj ponavljanja. Aplikacija računa procenjeni 1RM i od toga kasnije pravi plan.")
 
     data = load_core_data()
     vezbe = data["vezbe"]
-    exercise_col = _exercise_column_name(vezbe)
+    plan = data["plan"]
+    testovi = data["testovi_unos"]
+    email = normalize_email(user.get("Email"))
 
-    exercise_options = sorted([
-        v for v in vezbe[exercise_col].dropna().astype(str).unique().tolist()
-        if v.strip()
-    ])
+    exercise_col = exercise_column_name(vezbe)
+    exercise_options = sorted([v for v in vezbe[exercise_col].dropna().astype(str).unique().tolist() if v.strip()])
 
-    default_exercises = [v for v in ["Čučanj", "Bench press", "Iskorak", "Rameni potisak"] if v in exercise_options]
+    plan_exercises = all_plan_exercises(plan)
+    missing = missing_tests_for_user(email, plan_exercises, testovi)
+
+    if missing:
+        st.warning(f"Nedostaje test za {len(missing)} vežbi iz plana. Prvo unesi ove vežbe, pa će aplikacija moći da računa predlog.")
+        default_selection = missing
+    else:
+        st.success("Za sve vežbe iz plana postoji bar jedan test. Možeš dodati novi test ako želiš da ažuriraš plan.")
+        default_selection = plan_exercises[:6] if plan_exercises else exercise_options[:6]
 
     selected = st.multiselect(
-        "Izaberi vežbe za testiranje",
+        "Izaberi vežbe za testiranje / ažuriranje testa",
         options=exercise_options,
-        default=default_exercises if default_exercises else exercise_options[:4],
+        default=[x for x in default_selection if x in exercise_options],
     )
 
     if not selected:
@@ -371,19 +503,21 @@ def show_initial_tests_screen(user: Dict[str, object]) -> None:
     rows = []
     with st.form("testovi_form"):
         test_date = st.date_input("Datum testa", value=date.today())
+        st.caption("Kod asistentskih vežbi test ne mora biti pravi maksimum. Unesi sigurnu radnu kilažu i reps do procene, uz dobru tehniku.")
         for ex in selected:
-            st.markdown(f"**{ex}**")
+            meta = get_exercise_meta(vezbe, ex)
+            max_reps = to_int(meta.get("Max reps test", 15), 15) or 15
+            rep_zone = normalize_text(meta.get("Rep zona", ""))
+            st.markdown(f"**{ex}**  ·  zona {rep_zone or '-'}  ·  max test reps {max_reps}")
             c1, c2, c3 = st.columns(3)
             kg = c1.number_input(f"Kilaža kg — {ex}", min_value=0.0, step=2.5, key=f"kg_{ex}")
-            reps = c2.number_input(f"Broj ponavljanja — {ex}", min_value=1, max_value=30, value=1, step=1, key=f"reps_{ex}")
+            reps = c2.number_input(f"Broj ponavljanja — {ex}", min_value=1, max_value=max(30, max_reps), value=min(max_reps, 10), step=1, key=f"reps_{ex}")
             one_rm = estimate_1rm(kg, reps) if kg > 0 else 0
-            c3.metric("Procena 1RM", f"{one_rm} kg" if one_rm else "—")
+            c3.metric("Procena 1RM", f"{format_kg(one_rm)} kg" if one_rm else "—")
             rows.append((ex, kg, reps, one_rm))
-
         submitted = st.form_submit_button("Sačuvaj testove")
 
     if submitted:
-        email = normalize_email(user.get("Email"))
         valid_rows = []
         for ex, kg, reps, one_rm in rows:
             if kg <= 0:
@@ -399,28 +533,163 @@ def show_initial_tests_screen(user: Dict[str, object]) -> None:
                 "Ime (auto)": user.get("Ime i Prezime", ""),
                 "Napomena": "Unos preko Streamlit aplikacije",
             })
-
         if not valid_rows:
             st.warning("Nema validnih unosa. Unesite kilažu za bar jednu vežbu.")
             return
-
         append_rows_to_sheet(SHEET_TEST_INPUT, valid_rows)
         st.success("Testovi su sačuvani u Google Sheets list UNOS_TESTOVA.")
         st.rerun()
 
 # ------------------------------------------------------------
-# 6) DANAŠNJI TRENING
+# 7) RACUNANJE PLANA
 # ------------------------------------------------------------
 
 def get_current_week_number() -> int:
     return ((date.today().isocalendar().week - 1) % 4) + 1
 
 
+def get_last_log(email: str, exercise: str, dnevnik: pd.DataFrame) -> Optional[Dict[str, Any]]:
+    if dnevnik.empty or "Email" not in dnevnik.columns or "Vežba" not in dnevnik.columns:
+        return None
+    df = dnevnik.copy()
+    df["__email"] = df["Email"].apply(normalize_email)
+    df["__ex"] = df["Vežba"].apply(lambda x: normalize_text(x).lower())
+    df = df[(df["__email"] == normalize_email(email)) & (df["__ex"] == normalize_text(exercise).lower())]
+    if df.empty:
+        return None
+    sort_col = "Timestamp" if "Timestamp" in df.columns else "Datum" if "Datum" in df.columns else None
+    if sort_col:
+        df["__date"] = pd.to_datetime(df[sort_col], errors="coerce")
+        df = df.sort_values("__date")
+    return df.iloc[-1].to_dict()
+
+
+def apply_progression_correction(base_kg: float, exercise_meta: Dict[str, Any], target_sets: int, target_reps: int, target_rir: int, last_log: Optional[Dict[str, Any]], round_step: float) -> Tuple[float, str]:
+    if not base_kg or base_kg <= 0:
+        return base_kg, "nema testa"
+    if not last_log:
+        return base_kg, "prvi plan posle testa"
+
+    step = to_float(exercise_meta.get("Napredak (kg)"), round_step) or round_step
+    done_kg = to_float(last_log.get("Urađeno kg"), 0) or to_float(last_log.get("Plan kg"), 0)
+    done_sets = to_int(last_log.get("Urađeno ser."), 0) or to_int(last_log.get("Plan ser."), 0)
+    done_reps = to_int(last_log.get("Urađeno reps"), 0) or to_int(last_log.get("Plan reps"), 0)
+    rir = to_int(last_log.get("RIR stvarni"), target_rir)
+
+    completed = True
+    if target_sets and done_sets and done_sets < target_sets:
+        completed = False
+    if target_reps and done_reps and done_reps < target_reps:
+        completed = False
+    if done_kg and done_kg < base_kg - 0.01:
+        completed = False
+
+    if completed and rir >= target_rir + 2:
+        return round_to_step(base_kg + step, round_step), f"bilo lako (RIR {rir}) → +{format_kg(step)} kg"
+    if (not completed) or rir <= max(0, target_rir - 2):
+        return max(0, round_to_step(base_kg - step, round_step)), f"bilo teško/neodrađeno (RIR {rir}) → -{format_kg(step)} kg ili zadržati"
+    return base_kg, f"dobro pogođeno (RIR {rir}) → zadrži"
+
+
+def calc_main_plan(email: str, exercise: str, week: int, user: Dict[str, Any], vezbe: pd.DataFrame, testovi: pd.DataFrame, dnevnik: pd.DataFrame) -> Dict[str, Any]:
+    settings = load_training_settings()
+    round_step = settings["round_step"]
+    goal = normalize_text(user.get("Cilj"))
+    goal_set = get_goal_settings(goal)
+    test = latest_test_for(email, exercise, testovi)
+    meta = get_exercise_meta(vezbe, exercise)
+    target_rir = to_int(goal_set.get("RIR Cilj"), 3)
+
+    if not test:
+        return {"Vežba": exercise, "Tip": "Glavna", "Plan tekst": "Čeka test", "Plan kg": "", "Plan ser.": "", "Plan reps": "", "Plan RIR": target_rir, "Korekcija": "unesi test"}
+
+    one_rm = to_float(test.get("__1rm"), 0)
+    tm = round_to_step(one_rm * to_float(goal_set.get("TM %"), 0.9), round_step)
+    scheme = DEFAULT_531_WEEKS.get(int(week), DEFAULT_531_WEEKS[1])
+    set_texts = []
+    planned_volume = 0.0
+    top_kg = 0.0
+    top_reps_numeric = 0
+    for pct, reps in scheme:
+        kg = round_to_step(tm * pct, round_step)
+        set_texts.append(f"{format_kg(kg)}×{reps}")
+        rep_num = to_int(reps, 1)
+        planned_volume += kg * rep_num
+        top_kg = kg
+        top_reps_numeric = rep_num
+
+    last_log = get_last_log(email, exercise, dnevnik)
+    corrected_top_kg, correction_note = apply_progression_correction(top_kg, meta, 3, top_reps_numeric, target_rir, last_log, round_step)
+    if corrected_top_kg != top_kg:
+        set_texts[-1] = f"{format_kg(corrected_top_kg)}×{scheme[-1][1]}"
+
+    plan_text = f"1RM {format_kg(one_rm)} kg | TM {format_kg(tm)} kg | " + " / ".join(set_texts)
+    return {
+        "Vežba": exercise,
+        "Tip": "Glavna",
+        "Plan tekst": plan_text,
+        "Plan kg": corrected_top_kg,
+        "Plan ser.": 3,
+        "Plan reps": "/".join([str(r) for _, r in scheme]),
+        "Plan RIR": target_rir,
+        "Korekcija": correction_note,
+        "Plan volumen": round(planned_volume, 1),
+    }
+
+
+def calc_assist_plan(email: str, exercise: str, week: int, user: Dict[str, Any], vezbe: pd.DataFrame, testovi: pd.DataFrame, dnevnik: pd.DataFrame) -> Dict[str, Any]:
+    settings = load_training_settings()
+    round_step = settings["round_step"]
+    goal = normalize_text(user.get("Cilj"))
+    goal_set = get_goal_settings(goal)
+    test = latest_test_for(email, exercise, testovi)
+    meta = get_exercise_meta(vezbe, exercise)
+
+    rep_zone = normalize_text(meta.get("Rep zona", "")) or normalize_text(goal_set.get("Zona Asist.")) or "10-15"
+    low_rep, high_rep = parse_range(rep_zone, fallback=parse_range(goal_set.get("Zona Asist."), (10, 15)))
+    max_reps_test = to_int(meta.get("Max reps test"), high_rep) or high_rep
+    target_rir = to_int(goal_set.get("RIR Asist."), 3)
+    sets_text = ASSIST_WEEK_SETS.get(int(week), "2")
+    base_sets = 2 if sets_text == "1-2" else to_int(sets_text, 2)
+    base_sets = max(1, base_sets + to_int(goal_set.get("Serije+"), 0))
+    week_factor = ASSIST_WEEK_FACTOR.get(int(week), 1.0)
+    kg_factor = to_float(goal_set.get("Kg Faktor"), 1.0)
+
+    if not test:
+        return {"Vežba": exercise, "Tip": "Asistencija", "Plan tekst": f"Čeka test | cilj zona {rep_zone}, RIR {target_rir}", "Plan kg": "", "Plan ser.": base_sets, "Plan reps": rep_zone, "Plan RIR": target_rir, "Korekcija": "unesi test"}
+
+    one_rm = to_float(test.get("__1rm"), 0)
+    # Epley unazad: za ciljni broj ponavljanja + RIR od procenjenog 1RM dobijamo radnu kilazu.
+    target_reps_for_calc = high_rep
+    base_kg = one_rm / (1 + ((target_reps_for_calc + target_rir) / 30))
+    base_kg = round_to_step(base_kg * week_factor * kg_factor, round_step)
+
+    last_log = get_last_log(email, exercise, dnevnik)
+    corrected_kg, correction_note = apply_progression_correction(base_kg, meta, base_sets, high_rep, target_rir, last_log, round_step)
+
+    plan_text = f"{base_sets}×{rep_zone} @ {format_kg(corrected_kg)} kg | cilj RIR {target_rir} | 1RM {format_kg(one_rm)} kg"
+    return {
+        "Vežba": exercise,
+        "Tip": "Asistencija",
+        "Plan tekst": plan_text,
+        "Plan kg": corrected_kg,
+        "Plan ser.": base_sets,
+        "Plan reps": rep_zone,
+        "Plan RIR": target_rir,
+        "Korekcija": correction_note,
+        "Plan volumen": round(corrected_kg * base_sets * high_rep, 1),
+    }
+
+
 def build_training_plan_for_user(user: Dict[str, object], week: int, trening: int) -> pd.DataFrame:
     data = load_core_data()
     plan = data["plan"].copy()
+    vezbe = data["vezbe"]
+    testovi = data["testovi_unos"]
+    dnevnik = data["dnevnik"]
+    email = normalize_email(user.get("Email"))
 
-    required = ["Ned.", "Trening", "Glavna vežba", "Plan glavne vežbe", "Asistencije — skraćeno"]
+    required = ["Ned.", "Trening", "Glavna vežba", "Asistencije — skraćeno"]
     missing = [c for c in required if c not in plan.columns]
     if missing:
         st.error(f"U listu {SHEET_PLAN} nedostaju kolone: {missing}")
@@ -435,35 +704,23 @@ def build_training_plan_for_user(user: Dict[str, object], week: int, trening: in
 
     rows = []
     for _, r in plan.iterrows():
-        glavna = normalize_text(r.get("Glavna vežba"))
-        if glavna:
-            rows.append({
-                "Vežba": glavna,
-                "Tip": "Glavna",
-                "Plan tekst": normalize_text(r.get("Plan glavne vežbe")),
-                "Plan kg": extract_first_number(r.get("Plan glavne vežbe")),
-                "Plan ser.": None,
-                "Plan reps": None,
-            })
-
-        asist = normalize_text(r.get("Asistencije — skraćeno"))
-        if asist:
-            for a in [x.strip() for x in asist.split("/") if x.strip()]:
-                rows.append({
-                    "Vežba": a,
-                    "Tip": "Asistencija",
-                    "Plan tekst": "Po planu trenera",
-                    "Plan kg": None,
-                    "Plan ser.": None,
-                    "Plan reps": None,
-                })
-
+        main = normalize_text(r.get("Glavna vežba"))
+        if main:
+            rows.append(calc_main_plan(email, main, week, user, vezbe, testovi, dnevnik))
+        for a in parse_assistants(r.get("Asistencije — skraćeno", "")):
+            rows.append(calc_assist_plan(email, a, week, user, vezbe, testovi, dnevnik))
     return pd.DataFrame(rows)
 
+# ------------------------------------------------------------
+# 8) DANAŠNJI TRENING
+# ------------------------------------------------------------
 
 def show_today_training_screen(user: Dict[str, object]) -> None:
     st.header("Današnji trening")
-    st.write("Upisuješ samo odstupanja. Ako je urađeno tačno po planu, polja mogu ostati prazna.")
+    st.write("Aplikacija računa predlog iz testova. Ti upisuješ samo odstupanja: ako je nešto urađeno drugačije, upiši stvarno stanje.")
+
+    goal = normalize_text(user.get("Cilj")) or "Snaga+Hipertrofija"
+    st.info(f"Cilj programa: **{goal}**. Glavne vežbe idu po 5/3/1, asistencije po testu, rep zoni i ciljanom RIR-u.")
 
     c1, c2 = st.columns(2)
     week = c1.selectbox("Nedelja ciklusa", options=[1, 2, 3, 4], index=get_current_week_number() - 1)
@@ -474,45 +731,55 @@ def show_today_training_screen(user: Dict[str, object]) -> None:
         st.warning("Nema pronađenog plana za izabranu nedelju i trening.")
         return
 
-    st.dataframe(plan_df[["Vežba", "Tip", "Plan tekst"]], use_container_width=True, hide_index=True)
+    st.subheader("Predlog plana")
+    display_cols = ["Vežba", "Tip", "Plan tekst", "Plan RIR", "Korekcija"]
+    st.dataframe(plan_df[display_cols], use_container_width=True, hide_index=True)
+
+    if (plan_df["Korekcija"].astype(str).str.contains("unesi test", case=False, na=False)).any():
+        st.warning("Neke vežbe nemaju test. Pređi na ekran Testovi i unesi test da bi aplikacija računala kilažu.")
 
     with st.form("dnevnik_form"):
         st.subheader("Unos odstupanja")
+        st.caption("Ako je urađeno tačno po planu, ne moraš ništa da upisuješ. Ako želiš da zabeležiš trening i bez odstupanja, upiši bar RIR ili napomenu.")
         entries = []
         for idx, row in plan_df.iterrows():
             ex = row["Vežba"]
-            st.markdown(f"**{ex}** — {row['Tip']}")
+            st.markdown(f"**{ex}** — {row['Tip']}  ·  plan: {row['Plan tekst']}")
             c1, c2, c3, c4, c5 = st.columns([1, 1, 1, 1, 2])
+            plan_kg_value = to_float(row.get("Plan kg"), 0)
+            default_rir = to_int(row.get("Plan RIR"), 3)
             done_kg = c1.number_input("Urađeno kg", min_value=0.0, step=2.5, key=f"done_kg_{idx}")
             done_sets = c2.number_input("Serije", min_value=0, step=1, key=f"sets_{idx}")
             done_reps = c3.number_input("Reps", min_value=0, step=1, key=f"reps_{idx}")
-            rir = c4.number_input("RIR", min_value=0, max_value=10, step=1, key=f"rir_{idx}")
+            rir = c4.number_input("RIR", min_value=0, max_value=10, value=default_rir, step=1, key=f"rir_{idx}")
             note = c5.text_input("Napomena", key=f"note_{idx}")
             entries.append({
                 "exercise": ex,
-                "plan_kg": row.get("Plan kg"),
-                "plan_sets": row.get("Plan ser."),
-                "plan_reps": row.get("Plan reps"),
+                "plan_kg": plan_kg_value if plan_kg_value > 0 else "",
+                "plan_sets": row.get("Plan ser.", ""),
+                "plan_reps": row.get("Plan reps", ""),
                 "done_kg": done_kg if done_kg > 0 else None,
                 "done_sets": int(done_sets) if done_sets > 0 else None,
                 "done_reps": int(done_reps) if done_reps > 0 else None,
                 "rir": int(rir),
                 "note": note,
             })
-
         submitted = st.form_submit_button("Sačuvaj trening")
 
     if submitted:
         now = datetime.now()
         rows_to_write = []
         for e in entries:
+            # Upisujemo red ako postoji odstupanje, RIR ili napomena.
             has_change = any([e["done_kg"], e["done_sets"], e["done_reps"], e["note"]])
+            # Pošto RIR ima default, nećemo samo zbog njega upisivati sve vežbe automatski.
             if not has_change:
                 continue
 
-            kg_for_volume = e["done_kg"] or e["plan_kg"] or 0
-            sets_for_volume = e["done_sets"] or e["plan_sets"] or 0
-            reps_for_volume = e["done_reps"] or e["plan_reps"] or 0
+            kg_for_volume = e["done_kg"] or to_float(e["plan_kg"], 0)
+            # Za Plan ser/reps mogu biti tekstovi; za volumen uzimamo prvi broj.
+            sets_for_volume = e["done_sets"] or to_int(e["plan_sets"], 0)
+            reps_for_volume = e["done_reps"] or to_int(e["plan_reps"], 0)
             volume = kg_for_volume * sets_for_volume * reps_for_volume if kg_for_volume and sets_for_volume and reps_for_volume else ""
 
             rows_to_write.append({
@@ -535,25 +802,21 @@ def show_today_training_screen(user: Dict[str, object]) -> None:
                 "Napomena": e["note"],
                 "Volumen (kg)": volume,
             })
-
         if not rows_to_write:
             st.info("Nema odstupanja za upis. To znači da je plan urađen kako je zadat.")
             return
-
         append_rows_to_sheet(SHEET_DNEVNIK, rows_to_write)
         st.success("Trening je sačuvan u Google Sheets list DNEVNIK_UNOS.")
         st.rerun()
 
 # ------------------------------------------------------------
-# 7) GLAVNI TOK APLIKACIJE
+# 9) GLAVNI TOK APLIKACIJE
 # ------------------------------------------------------------
 
 def main() -> None:
     st.set_page_config(page_title=APP_TITLE, page_icon="🏋️", layout="wide")
-
     if "logged_in" not in st.session_state:
         st.session_state["logged_in"] = False
-
     if not st.session_state["logged_in"]:
         show_login_screen()
         return
@@ -568,20 +831,18 @@ def main() -> None:
         if st.button("Odjavi se"):
             st.session_state.clear()
             st.rerun()
-
         page = st.radio("Izaberi ekran", ["Današnji trening", "Testovi", "Moji podaci"])
-
         if st.button("Osveži podatke"):
             clear_caches()
             st.rerun()
 
     data = load_core_data()
     email = normalize_email(user.get("Email"))
+    plan_exercises = all_plan_exercises(data["plan"])
+    missing = missing_tests_for_user(email, plan_exercises, data["testovi_unos"])
 
-    if not user_has_tests(email, data["testovi_unos"]) and page != "Moji podaci":
-        st.warning("Prvo treba uneti početne testove da bi plan mogao pravilno da se računa.")
-        show_initial_tests_screen(user)
-        return
+    if missing and page == "Današnji trening":
+        st.warning("Za potpun plan nedostaju testovi za neke vežbe. Možeš ipak otvoriti trening, ali će za te vežbe pisati 'Čeka test'.")
 
     if page == "Današnji trening":
         show_today_training_screen(user)
@@ -596,3 +857,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
