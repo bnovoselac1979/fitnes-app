@@ -1,6 +1,6 @@
 # streamlit_app_fitnes_gsheets.py
 # Fitnes klub aplikacija preko Google Sheets baze
-# V7: V6 + automatska priprema Google Sheets strukture za šablone programa
+# V8: šabloni programa + individualne izmene + PODESAVANJA + admin dodela programa
 
 from __future__ import annotations
 
@@ -264,6 +264,16 @@ def read_sheet(sheet_name: str) -> pd.DataFrame:
     return df
 
 
+def read_sheet_optional(sheet_name: str) -> pd.DataFrame:
+    """Čita list ako postoji; ako ne postoji, vrati prazan DataFrame.
+    Ovo je važno dok postepeno uvodimo PROGRAMI_SABLONI i INDIVIDUALNE_IZMENE.
+    """
+    try:
+        return read_sheet(sheet_name)
+    except Exception:
+        return pd.DataFrame()
+
+
 @st.cache_data(ttl=10, show_spinner=False)
 def load_core_data() -> Dict[str, pd.DataFrame]:
     return {
@@ -272,6 +282,8 @@ def load_core_data() -> Dict[str, pd.DataFrame]:
         "testovi_unos": read_sheet(SHEET_TEST_INPUT),
         "dnevnik": read_sheet(SHEET_DNEVNIK),
         "plan": read_sheet(SHEET_PLAN),
+        "program_templates": read_sheet_optional(SHEET_PROGRAM_TEMPLATES),
+        "individual_changes": read_sheet_optional(SHEET_INDIVIDUAL_CHANGES),
     }
 
 
@@ -493,6 +505,83 @@ def all_plan_exercises(plan: pd.DataFrame) -> List[str]:
     return unique
 
 
+def template_program_ids(program_templates: pd.DataFrame) -> List[str]:
+    if program_templates.empty or "Program_ID" not in program_templates.columns:
+        return []
+    ids = []
+    seen = set()
+    for x in program_templates["Program_ID"].dropna().tolist():
+        pid = normalize_text(x)
+        if pid and pid.lower() not in seen:
+            ids.append(pid)
+            seen.add(pid.lower())
+    return sorted(ids)
+
+
+def apply_individual_changes(plan_df: pd.DataFrame, user: Dict[str, Any], changes: pd.DataFrame) -> pd.DataFrame:
+    """Menja vežbe za konkretnog vežbača prema listu INDIVIDUALNE_IZMENE.
+    Ako za email postoji Vezba_Original -> Vezba_Zamena i Aktivno=Da, u planu se menja samo naziv vežbe.
+    """
+    if plan_df.empty or changes.empty or "Email" not in changes.columns:
+        return plan_df
+    required = {"Vezba_Original", "Vezba_Zamena"}
+    if not required.issubset(set(changes.columns)):
+        return plan_df
+    email = normalize_email(user.get("Email"))
+    ch = changes.copy()
+    ch["__email"] = ch["Email"].apply(normalize_email)
+    if "Aktivno" in ch.columns:
+        ch = ch[ch["Aktivno"].apply(lambda x: normalize_text(x).lower() in ["da", "yes", "1", "true", "aktivno", "active"])]
+    ch = ch[ch["__email"] == email]
+    if ch.empty:
+        return plan_df
+    repl = {normalize_text(r.get("Vezba_Original")).lower(): normalize_text(r.get("Vezba_Zamena")) for _, r in ch.iterrows() if normalize_text(r.get("Vezba_Original")) and normalize_text(r.get("Vezba_Zamena"))}
+    if not repl:
+        return plan_df
+    out = plan_df.copy()
+    if "Vezba" in out.columns:
+        out["Vezba_Original_U_Sablonu"] = out["Vezba"]
+        out["Vezba"] = out["Vezba"].apply(lambda x: repl.get(normalize_text(x).lower(), x))
+    return out
+
+
+def template_rows_for_user(user: Dict[str, Any], week: Optional[int] = None, trening: Optional[int] = None) -> pd.DataFrame:
+    data = load_core_data()
+    templates = data.get("program_templates", pd.DataFrame()).copy()
+    changes = data.get("individual_changes", pd.DataFrame()).copy()
+    program_id = normalize_text(user.get("Program_ID"))
+    if templates.empty or not program_id or "Program_ID" not in templates.columns:
+        return pd.DataFrame()
+    df = templates[templates["Program_ID"].apply(lambda x: normalize_text(x).lower()) == program_id.lower()].copy()
+    if df.empty:
+        return pd.DataFrame()
+    if week is not None and "Nedelja" in df.columns:
+        df = df[pd.to_numeric(df["Nedelja"], errors="coerce").fillna(-1).astype(int) == int(week)]
+    if trening is not None and "Trening" in df.columns:
+        df = df[pd.to_numeric(df["Trening"], errors="coerce").fillna(-1).astype(int) == int(trening)]
+    if "Redosled" in df.columns:
+        df["__ord"] = pd.to_numeric(df["Redosled"], errors="coerce").fillna(999)
+        df = df.sort_values(["Nedelja", "Trening", "__ord"] if "Nedelja" in df.columns and "Trening" in df.columns else ["__ord"])
+    df = apply_individual_changes(df, user, changes)
+    return df
+
+
+def all_user_plan_exercises(user: Dict[str, Any], fallback_plan: pd.DataFrame) -> List[str]:
+    tdf = template_rows_for_user(user)
+    if not tdf.empty and "Vezba" in tdf.columns:
+        raw = [normalize_text(x) for x in tdf["Vezba"].tolist() if normalize_text(x)]
+    else:
+        raw = all_plan_exercises(fallback_plan)
+    seen = set()
+    out = []
+    for ex in raw:
+        key = ex.lower()
+        if key not in seen:
+            out.append(ex)
+            seen.add(key)
+    return out
+
+
 def missing_tests_for_user(email: str, exercises: List[str], testovi: pd.DataFrame) -> List[str]:
     missing = []
     for ex in exercises:
@@ -514,7 +603,7 @@ def show_initial_tests_screen(user: Dict[str, object]) -> None:
     exercise_col = exercise_column_name(vezbe)
     exercise_options = sorted([v for v in vezbe[exercise_col].dropna().astype(str).unique().tolist() if v.strip()])
 
-    plan_exercises = all_plan_exercises(plan)
+    plan_exercises = all_user_plan_exercises(user, plan)
     missing = missing_tests_for_user(email, plan_exercises, testovi)
 
     if missing:
@@ -715,7 +804,139 @@ def calc_assist_plan(email: str, exercise: str, week: int, user: Dict[str, Any],
     }
 
 
-def build_training_plan_for_user(user: Dict[str, object], week: int, trening: int) -> pd.DataFrame:
+def exercise_type_from_template_or_base(row: Dict[str, Any], vezbe: pd.DataFrame, exercise: str) -> str:
+    tip = normalize_text(row.get("Tip"))
+    if tip:
+        low = tip.lower()
+        if low.startswith("glav") or low in ["main", "osnovna"]:
+            return "Glavna"
+        return "Asistencija"
+    meta = get_exercise_meta(vezbe, exercise)
+    meta_tip = normalize_text(meta.get("Tip") or meta.get("Vrsta") or meta.get("Kategorija"))
+    if meta_tip.lower().startswith("glav"):
+        return "Glavna"
+    return "Asistencija"
+
+
+def effective_user_for_template(user: Dict[str, Any], row: Dict[str, Any]) -> Dict[str, Any]:
+    """Cilj iz šablona ima prednost nad ciljem vežbača; ako je prazan, koristi se VEZBACI.Cilj."""
+    out = dict(user)
+    row_goal = normalize_text(row.get("Cilj"))
+    if row_goal:
+        out["Cilj"] = row_goal
+    return out
+
+
+def calc_assist_plan_template(email: str, row: Dict[str, Any], week: int, user: Dict[str, Any], vezbe: pd.DataFrame, testovi: pd.DataFrame, dnevnik: pd.DataFrame) -> Dict[str, Any]:
+    settings = load_training_settings()
+    round_step = settings["round_step"]
+    exercise = normalize_text(row.get("Vezba"))
+    goal = normalize_text(row.get("Cilj")) or normalize_text(user.get("Cilj"))
+    goal_set = get_goal_settings(goal)
+    test = latest_test_for(email, exercise, testovi)
+    meta = get_exercise_meta(vezbe, exercise)
+
+    rep_zone = normalize_text(row.get("Ponavljanja")) or normalize_text(meta.get("Rep zona", "")) or normalize_text(goal_set.get("Zona Asist.")) or "10-15"
+    low_rep, high_rep = parse_range(rep_zone, fallback=parse_range(goal_set.get("Zona Asist."), (10, 15)))
+    target_rir = to_int(row.get("Plan_RIR"), to_int(goal_set.get("RIR Asist."), 3))
+
+    sets_from_template = to_int(row.get("Serije"), 0)
+    if sets_from_template > 0:
+        base_sets = sets_from_template
+    else:
+        sets_text = ASSIST_WEEK_SETS.get(int(week), "2")
+        base_sets = 2 if sets_text == "1-2" else to_int(sets_text, 2)
+        base_sets = max(1, base_sets + to_int(goal_set.get("Serije+"), 0))
+
+    pct_raw = to_float(row.get("Procenat"), 0)
+    if pct_raw > 1.5:
+        pct = pct_raw / 100.0
+    elif pct_raw > 0:
+        pct = pct_raw
+    else:
+        pct = 0.0
+
+    week_factor = ASSIST_WEEK_FACTOR.get(int(week), 1.0)
+    kg_factor = to_float(goal_set.get("Kg Faktor"), 1.0)
+
+    if not test:
+        return {
+            "Vežba": exercise,
+            "Tip": "Asistencija",
+            "Plan tekst": f"Čeka test | cilj {goal or '-'} | zona {rep_zone}, RIR {target_rir}",
+            "Plan kg": "",
+            "Plan ser.": base_sets,
+            "Plan reps": rep_zone,
+            "Plan RIR": target_rir,
+            "Korekcija": "unesi test",
+            "Izvor": "PROGRAMI_SABLONI",
+        }
+
+    one_rm = to_float(test.get("__1rm"), 0)
+    if pct > 0:
+        base_kg = one_rm * pct
+        method = f"{round(pct * 100)}% od 1RM"
+    else:
+        # Ako u PROGRAMI_SABLONI nije unet procenat, koristi se postojeća logika iz PODESAVANJA:
+        # Epley unazad za ciljnu rep zonu + RIR.
+        target_reps_for_calc = high_rep
+        base_kg = one_rm / (1 + ((target_reps_for_calc + target_rir) / 30))
+        method = "račun iz zone reps + RIR"
+
+    base_kg = round_to_step(base_kg * week_factor * kg_factor, round_step)
+    last_log = get_last_log(email, exercise, dnevnik)
+    corrected_kg, correction_note = apply_progression_correction(base_kg, meta, base_sets, high_rep, target_rir, last_log, round_step)
+
+    plan_text = f"{base_sets}×{rep_zone} @ {format_kg(corrected_kg)} kg | RIR {target_rir} | 1RM {format_kg(one_rm)} kg | {method}"
+    if goal:
+        plan_text += f" | cilj {goal}"
+
+    return {
+        "Vežba": exercise,
+        "Tip": "Asistencija",
+        "Plan tekst": plan_text,
+        "Plan kg": corrected_kg,
+        "Plan ser.": base_sets,
+        "Plan reps": rep_zone,
+        "Plan RIR": target_rir,
+        "Korekcija": correction_note,
+        "Plan volumen": round(corrected_kg * base_sets * high_rep, 1),
+        "Izvor": "PROGRAMI_SABLONI",
+    }
+
+
+def build_training_plan_from_templates(user: Dict[str, Any], week: int, trening: int) -> pd.DataFrame:
+    data = load_core_data()
+    tdf = template_rows_for_user(user, week=week, trening=trening)
+    if tdf.empty:
+        return pd.DataFrame()
+
+    vezbe = data["vezbe"]
+    testovi = data["testovi_unos"]
+    dnevnik = data["dnevnik"]
+    email = normalize_email(user.get("Email"))
+    rows = []
+    for _, r in tdf.iterrows():
+        row = r.to_dict()
+        ex = normalize_text(row.get("Vezba"))
+        if not ex:
+            continue
+        tip = exercise_type_from_template_or_base(row, vezbe, ex)
+        eff_user = effective_user_for_template(user, row)
+        if tip == "Glavna":
+            plan_row = calc_main_plan(email, ex, week, eff_user, vezbe, testovi, dnevnik)
+            plan_row["Izvor"] = "PROGRAMI_SABLONI"
+            plan_row["Cilj"] = normalize_text(eff_user.get("Cilj"))
+        else:
+            plan_row = calc_assist_plan_template(email, row, week, eff_user, vezbe, testovi, dnevnik)
+            plan_row["Cilj"] = normalize_text(eff_user.get("Cilj"))
+        if normalize_text(row.get("Vezba_Original_U_Sablonu")) and normalize_text(row.get("Vezba_Original_U_Sablonu")) != ex:
+            plan_row["Korekcija"] = f"Zamena: {row.get('Vezba_Original_U_Sablonu')} → {ex}. " + normalize_text(plan_row.get("Korekcija"))
+        rows.append(plan_row)
+    return pd.DataFrame(rows)
+
+
+def build_training_plan_from_old_sheet(user: Dict[str, object], week: int, trening: int) -> pd.DataFrame:
     data = load_core_data()
     plan = data["plan"].copy()
     vezbe = data["vezbe"]
@@ -740,10 +961,25 @@ def build_training_plan_for_user(user: Dict[str, object], week: int, trening: in
     for _, r in plan.iterrows():
         main = normalize_text(r.get("Glavna vežba"))
         if main:
-            rows.append(calc_main_plan(email, main, week, user, vezbe, testovi, dnevnik))
+            row = calc_main_plan(email, main, week, user, vezbe, testovi, dnevnik)
+            row["Izvor"] = "A4_MESEC_KOMPAKT"
+            rows.append(row)
         for a in parse_assistants(r.get("Asistencije — skraćeno", "")):
-            rows.append(calc_assist_plan(email, a, week, user, vezbe, testovi, dnevnik))
+            row = calc_assist_plan(email, a, week, user, vezbe, testovi, dnevnik)
+            row["Izvor"] = "A4_MESEC_KOMPAKT"
+            rows.append(row)
     return pd.DataFrame(rows)
+
+
+def build_training_plan_for_user(user: Dict[str, object], week: int, trening: int) -> pd.DataFrame:
+    """Primarno koristi novi sistem: VEZBACI.Program_ID -> PROGRAMI_SABLONI -> INDIVIDUALNE_IZMENE.
+    Ako vežbač nema Program_ID ili nema redova za taj šablon, aplikacija se vraća na stari list A4_MESEC_KOMPAKT.
+    """
+    df = build_training_plan_from_templates(user, week, trening)
+    if not df.empty:
+        return df
+    return build_training_plan_from_old_sheet(user, week, trening)
+
 
 # ------------------------------------------------------------
 # 8) DANAŠNJI TRENING
@@ -754,7 +990,11 @@ def show_today_training_screen(user: Dict[str, object]) -> None:
     st.write("Aplikacija računa predlog iz testova. Ti upisuješ samo odstupanja: ako je nešto urađeno drugačije, upiši stvarno stanje.")
 
     goal = normalize_text(user.get("Cilj")) or "Snaga+Hipertrofija"
-    st.info(f"Cilj programa: **{goal}**. Glavne vežbe idu po 5/3/1, asistencije po testu, rep zoni i ciljanom RIR-u.")
+    program_id = normalize_text(user.get("Program_ID"))
+    if program_id:
+        st.info(f"Program: **{program_id}** · Cilj: **{goal}**. Glavne vežbe idu po 5/3/1, asistencije po šablonu/PODESAVANJA i testu.")
+    else:
+        st.info(f"Cilj programa: **{goal}**. Vežbač nema Program_ID, zato aplikacija koristi stari plan ako postoji.")
 
     c1, c2 = st.columns(2)
     week = c1.selectbox("Nedelja ciklusa", options=[1, 2, 3, 4], index=get_current_week_number() - 1)
@@ -766,7 +1006,7 @@ def show_today_training_screen(user: Dict[str, object]) -> None:
         return
 
     st.subheader("Predlog plana")
-    display_cols = ["Vežba", "Tip", "Plan tekst", "Plan RIR", "Korekcija"]
+    display_cols = [c for c in ["Vežba", "Tip", "Cilj", "Plan tekst", "Plan RIR", "Korekcija", "Izvor"] if c in plan_df.columns]
     st.dataframe(plan_df[display_cols], use_container_width=True, hide_index=True)
 
     if (plan_df["Korekcija"].astype(str).str.contains("unesi test", case=False, na=False)).any():
@@ -1386,6 +1626,43 @@ def update_vezbac_aktivan(email: str, active_value: str) -> bool:
     return True
 
 
+def update_vezbac_fields(email: str, updates: Dict[str, Any]) -> bool:
+    """Ažurira više kolona u VEZBACI za izabranog vežbača.
+    Koristi se za dodelu Program_ID i Cilj iz Admin panela.
+    """
+    ws = get_ws(SHEET_VEZBACI)
+    headers, idx, values = _sheet_headers_and_indexes(SHEET_VEZBACI)
+    if "Email" not in idx:
+        return False
+    # Ako neke kolone ne postoje, dodaj ih.
+    missing = [c for c in updates.keys() if c not in idx]
+    if missing:
+        ensure_columns_on_header_row(SHEET_VEZBACI, missing)
+        headers, idx, values = _sheet_headers_and_indexes(SHEET_VEZBACI)
+    rows = find_row_numbers_by_email(SHEET_VEZBACI, email)
+    if not rows:
+        return False
+    for r in rows:
+        for col, value in updates.items():
+            if col in idx:
+                ws.update_cell(r, idx[col], to_sheet_value(value))
+    clear_caches()
+    return True
+
+
+def goal_options_from_settings() -> List[str]:
+    settings = load_training_settings()
+    goals = list(settings.get("goals", {}).keys())
+    clean = []
+    seen = set()
+    for g in goals:
+        ng = normalize_text(g)
+        if ng and ng.lower() not in seen:
+            clean.append(ng)
+            seen.add(ng.lower())
+    return clean or list(DEFAULT_GOAL_SETTINGS.keys())
+
+
 def mask_sifra(x: Any) -> str:
     s = normalize_sifra(x)
     if not s:
@@ -1454,6 +1731,30 @@ def show_admin_screen(user: Dict[str, object]) -> None:
                     st.rerun()
                 else:
                     st.error("Nisam uspeo da promenim status.")
+
+        st.divider()
+        st.subheader("Dodela programa i cilja")
+        program_templates = data.get("program_templates", pd.DataFrame())
+        program_options = template_program_ids(program_templates)
+        if not program_options:
+            st.warning("Još nema programa u listu PROGRAMI_SABLONI. Otvori karticu 'Podešavanje baze' i pripremi strukturu, pa unesi bar jedan Program_ID.")
+        else:
+            current_program = normalize_text(vrow.iloc[0].get("Program_ID", "")) if not vrow.empty and "Program_ID" in vrow.columns else ""
+            current_goal = normalize_text(vrow.iloc[0].get("Cilj", "")) if not vrow.empty and "Cilj" in vrow.columns else ""
+            program_choices = [""] + program_options
+            goal_choices = [""] + goal_options_from_settings()
+            p_index = program_choices.index(current_program) if current_program in program_choices else 0
+            g_index = goal_choices.index(current_goal) if current_goal in goal_choices else 0
+            cprog, cgoal = st.columns(2)
+            new_program = cprog.selectbox("Program_ID", program_choices, index=p_index, key="admin_program_assign")
+            new_goal = cgoal.selectbox("Cilj iz PODESAVANJA", goal_choices, index=g_index, key="admin_goal_assign")
+            st.caption("Program_ID dolazi iz lista PROGRAMI_SABLONI, a Cilj koristi parametre iz lista PODESAVANJA. Ako u samom šablonu vežbe piše Cilj, on ima prednost za tu vežbu.")
+            if st.button("Sačuvaj Program_ID i Cilj za vežbača", type="primary", use_container_width=True):
+                if update_vezbac_fields(selected_email, {"Program_ID": new_program, "Cilj": new_goal}):
+                    st.success("Program i cilj su sačuvani u list VEZBACI.")
+                    st.rerun()
+                else:
+                    st.error("Nisam uspeo da sačuvam program/cilj.")
 
     with tab_izvestaj:
         show_admin_report_screen(vezbaci, testovi, dnevnik)
@@ -1525,7 +1826,7 @@ def main() -> None:
 
     data = load_core_data()
     email = normalize_email(user.get("Email"))
-    plan_exercises = all_plan_exercises(data["plan"])
+    plan_exercises = all_user_plan_exercises(user, data["plan"])
     missing = missing_tests_for_user(email, plan_exercises, data["testovi_unos"])
 
     if missing and page == "Današnji trening":
