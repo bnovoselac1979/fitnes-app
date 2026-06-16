@@ -1,6 +1,6 @@
 # streamlit_app_fitnes_gsheets.py
 # Fitnes klub aplikacija preko Google Sheets baze
-# V4: testiranje svih vezbi + glavni 5/3/1 + asistencije po cilju + korekcija po dnevniku
+# V6: testiranje svih vežbi + plan + admin panel + A4 izveštaj vežbača
 
 from __future__ import annotations
 
@@ -809,8 +809,542 @@ def show_today_training_screen(user: Dict[str, object]) -> None:
         st.success("Trening je sačuvan u Google Sheets list DNEVNIK_UNOS.")
         st.rerun()
 
+
+
+
 # ------------------------------------------------------------
-# 9) GLAVNI TOK APLIKACIJE
+# 9A) ADMIN IZVESTAJ - A4 STAMPA
+# ------------------------------------------------------------
+
+def find_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
+    """Vraca ime kolone uz toleranciju na mala/velika slova i razmake."""
+    if df is None or df.empty:
+        return None
+    norm_map = {normalize_text(c).lower(): c for c in df.columns}
+    for cand in candidates:
+        key = normalize_text(cand).lower()
+        if key in norm_map:
+            return norm_map[key]
+    # labavije: bez specijalnih znakova
+    def simple(x: str) -> str:
+        return re.sub(r"[^a-zA-Z0-9čćžšđČĆŽŠĐ]+", "", normalize_text(x).lower())
+    simple_map = {simple(c): c for c in df.columns}
+    for cand in candidates:
+        key = simple(cand)
+        if key in simple_map:
+            return simple_map[key]
+    return None
+
+
+def add_datetime_column(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    date_col = find_col(df, ["Timestamp", "Vreme unosa", "Datum", "Date"])
+    if date_col:
+        df["__dt"] = pd.to_datetime(df[date_col], errors="coerce", dayfirst=True)
+    else:
+        df["__dt"] = pd.NaT
+    return df
+
+
+def add_volume_column(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    vol_col = find_col(df, ["Volumen (kg)", "Volumen", "Volume"])
+    if vol_col:
+        df["__volume"] = pd.to_numeric(df[vol_col], errors="coerce").fillna(0.0)
+    else:
+        kg_col = find_col(df, ["Urađeno kg", "Uradjeno kg", "Done kg", "Plan kg"])
+        set_col = find_col(df, ["Urađeno ser.", "Uradjeno ser.", "Serije", "Plan ser."])
+        rep_col = find_col(df, ["Urađeno reps", "Uradjeno reps", "Reps", "Plan reps"])
+        kg = pd.to_numeric(df[kg_col], errors="coerce").fillna(0.0) if kg_col else 0.0
+        sets = pd.to_numeric(df[set_col], errors="coerce").fillna(0.0) if set_col else 0.0
+        reps = pd.to_numeric(df[rep_col], errors="coerce").fillna(0.0) if rep_col else 0.0
+        df["__volume"] = kg * sets * reps
+    return df
+
+
+def one_rm_series_from_tests(df: pd.DataFrame) -> pd.Series:
+    one_col = find_col(df, ["Procena 1RM", "Ostvareni 1RM", "1RM", "e1RM"])
+    if one_col:
+        one = pd.to_numeric(df[one_col], errors="coerce")
+    else:
+        one = pd.Series([None] * len(df), index=df.index, dtype="float")
+    kg_col = find_col(df, ["Kilaža (kg)", "Kilaza (kg)", "Kilaža", "Kilaza", "kg"])
+    reps_col = find_col(df, ["Broj ponavljanja", "Ponavljanja", "Reps", "reps"])
+    if kg_col and reps_col:
+        kg = pd.to_numeric(df[kg_col], errors="coerce")
+        reps = pd.to_numeric(df[reps_col], errors="coerce")
+        calc = kg * (1 + reps / 30)
+        one = one.fillna(calc)
+    return one.fillna(0.0)
+
+
+def prepare_user_report(email: str, start_date: date, end_date: date, vezbaci: pd.DataFrame, testovi: pd.DataFrame, dnevnik: pd.DataFrame) -> Dict[str, Any]:
+    email = normalize_email(email)
+    user_row = {}
+    if not vezbaci.empty and "Email" in vezbaci.columns:
+        v = vezbaci[vezbaci["Email"].apply(normalize_email) == email]
+        if not v.empty:
+            user_row = v.iloc[0].to_dict()
+
+    # Dnevnik za period
+    logs = dnevnik.copy()
+    if not logs.empty and "Email" in logs.columns:
+        logs["__email"] = logs["Email"].apply(normalize_email)
+        logs = logs[logs["__email"] == email]
+    logs = add_datetime_column(logs)
+    logs = add_volume_column(logs)
+    if "__dt" in logs.columns:
+        mask = (logs["__dt"].dt.date >= start_date) & (logs["__dt"].dt.date <= end_date)
+        logs_period = logs[mask].copy()
+    else:
+        logs_period = logs.copy()
+
+    ex_col = find_col(logs_period, ["Vežba", "Vezba", "Naziv vežbe", "Exercise"])
+    rir_col = find_col(logs_period, ["RIR stvarni", "RIR", "rir"])
+    kg_col = find_col(logs_period, ["Urađeno kg", "Uradjeno kg", "Plan kg"])
+    sets_col = find_col(logs_period, ["Urađeno ser.", "Uradjeno ser.", "Plan ser."])
+    reps_col = find_col(logs_period, ["Urađeno reps", "Uradjeno reps", "Plan reps"])
+    trening_col = find_col(logs_period, ["Trening", "Training"])
+
+    total_volume = float(logs_period["__volume"].sum()) if "__volume" in logs_period.columns else 0.0
+    exercise_rows = len(logs_period)
+    avg_rir = None
+    if rir_col:
+        rir_vals = pd.to_numeric(logs_period[rir_col], errors="coerce").dropna()
+        if not rir_vals.empty:
+            avg_rir = float(rir_vals.mean())
+
+    if not logs_period.empty and "__dt" in logs_period.columns and logs_period["__dt"].notna().any():
+        if trening_col:
+            keys = logs_period["__dt"].dt.strftime("%Y-%m-%d") + "_T" + logs_period[trening_col].astype(str)
+            training_count = int(keys.nunique())
+        else:
+            training_count = int(logs_period["__dt"].dt.date.nunique())
+    else:
+        training_count = 0
+    avg_vol_per_training = total_volume / training_count if training_count else 0.0
+
+    session_volume = pd.DataFrame()
+    if not logs_period.empty and "__dt" in logs_period.columns and logs_period["__dt"].notna().any():
+        logs_period["__day"] = logs_period["__dt"].dt.date.astype(str)
+        if trening_col:
+            logs_period["__session"] = logs_period["__day"] + " / T" + logs_period[trening_col].astype(str)
+        else:
+            logs_period["__session"] = logs_period["__day"]
+        session_volume = logs_period.groupby("__session", as_index=False)["__volume"].sum().sort_values("__session")
+    max_session_volume = float(session_volume["__volume"].max()) if not session_volume.empty else 0.0
+
+    best_lifts = pd.DataFrame()
+    if ex_col and kg_col and not logs_period.empty:
+        tmp = logs_period.copy()
+        tmp["__kg"] = pd.to_numeric(tmp[kg_col], errors="coerce").fillna(0.0)
+        tmp["__sets"] = pd.to_numeric(tmp[sets_col], errors="coerce").fillna(0.0) if sets_col else 0.0
+        tmp["__reps"] = pd.to_numeric(tmp[reps_col], errors="coerce").fillna(0.0) if reps_col else 0.0
+        best_lifts = tmp.groupby(ex_col).agg(
+            **{"Najveća kg": ("__kg", "max"), "Ukupan volumen": ("__volume", "sum"), "Broj unosa": (ex_col, "count")}
+        ).reset_index().rename(columns={ex_col: "Vežba"}).sort_values("Ukupan volumen", ascending=False).head(10)
+
+    # Testovi i napredak
+    tests = testovi.copy()
+    if not tests.empty and "Email" in tests.columns:
+        tests["__email"] = tests["Email"].apply(normalize_email)
+        tests = tests[tests["__email"] == email]
+    tests = add_datetime_column(tests)
+    tests["__1rm"] = one_rm_series_from_tests(tests) if not tests.empty else []
+    test_ex_col = find_col(tests, ["Naziv vežbe", "Naziv vezbe", "Vežba", "Vezba", "Exercise"])
+    progress = pd.DataFrame()
+    if test_ex_col and not tests.empty:
+        if "__dt" in tests.columns:
+            tests = tests.sort_values("__dt")
+        rows = []
+        for ex, g in tests.groupby(test_ex_col):
+            g = g[g["__1rm"] > 0]
+            if g.empty:
+                continue
+            first = g.iloc[0]
+            last = g.iloc[-1]
+            first_rm = float(first["__1rm"])
+            last_rm = float(last["__1rm"])
+            diff = last_rm - first_rm
+            pct = (diff / first_rm * 100) if first_rm else 0.0
+            rows.append({
+                "Vežba": normalize_text(ex),
+                "Početni 1RM": round(first_rm, 1),
+                "Poslednji 1RM": round(last_rm, 1),
+                "Napredak kg": round(diff, 1),
+                "Napredak %": round(pct, 1),
+                "Broj testova": len(g),
+            })
+        if rows:
+            progress = pd.DataFrame(rows).sort_values("Napredak kg", ascending=False)
+
+    weekly = pd.DataFrame()
+    if not logs_period.empty and "__dt" in logs_period.columns and logs_period["__dt"].notna().any():
+        tmp = logs_period.copy()
+        tmp["Nedelja"] = tmp["__dt"].dt.to_period("W").astype(str)
+        weekly = tmp.groupby("Nedelja", as_index=False)["__volume"].sum().rename(columns={"__volume": "Volumen"})
+
+    return {
+        "user": user_row,
+        "logs_period": logs_period,
+        "tests": tests,
+        "progress": progress,
+        "best_lifts": best_lifts,
+        "weekly": weekly,
+        "training_count": training_count,
+        "exercise_rows": exercise_rows,
+        "total_volume": total_volume,
+        "avg_vol_per_training": avg_vol_per_training,
+        "max_session_volume": max_session_volume,
+        "avg_rir": avg_rir,
+        "period": (start_date, end_date),
+    }
+
+
+def fmt_num(x: Any, decimals: int = 0) -> str:
+    try:
+        val = float(x)
+    except Exception:
+        return "-"
+    if decimals == 0:
+        return f"{val:,.0f}".replace(",", ".")
+    return f"{val:,.{decimals}f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+def table_to_html(df: pd.DataFrame, max_rows: int = 8) -> str:
+    if df is None or df.empty:
+        return "<p class='muted'>Nema podataka za prikaz.</p>"
+    show = df.head(max_rows).copy()
+    return show.to_html(index=False, classes="report-table", border=0, escape=False)
+
+
+def build_a4_report_html(report: Dict[str, Any], trainer_note: str = "") -> str:
+    user = report.get("user", {}) or {}
+    name = normalize_text(user.get("Ime i Prezime")) or normalize_text(user.get("Ime")) or "Vežbač"
+    email = normalize_email(user.get("Email")) or ""
+    start_date, end_date = report["period"]
+    avg_rir = report.get("avg_rir")
+    avg_rir_text = fmt_num(avg_rir, 1) if avg_rir is not None else "-"
+    progress_html = table_to_html(report.get("progress", pd.DataFrame()), max_rows=8)
+    best_html = table_to_html(report.get("best_lifts", pd.DataFrame()), max_rows=8)
+    weekly = report.get("weekly", pd.DataFrame())
+    weekly_html = table_to_html(weekly, max_rows=6)
+    note_html = normalize_text(trainer_note).replace("\n", "<br>") or "&nbsp;<br>&nbsp;<br>&nbsp;"
+    generated = datetime.now().strftime("%d.%m.%Y. %H:%M")
+
+    return f"""
+<style>
+.report-a4 {{
+  background: white;
+  color: #111;
+  width: 210mm;
+  min-height: 297mm;
+  padding: 12mm 12mm 10mm 12mm;
+  margin: 0 auto;
+  border: 1px solid #ddd;
+  box-shadow: 0 0 8px rgba(0,0,0,.08);
+  font-family: Arial, sans-serif;
+  font-size: 11px;
+  line-height: 1.25;
+}}
+.report-title {{font-size: 20px; font-weight: 700; margin: 0 0 4px 0;}}
+.report-subtitle {{font-size: 11px; color:#555; margin-bottom: 10px;}}
+.report-section-title {{font-size: 13px; font-weight: 700; margin: 10px 0 5px 0; border-bottom: 1px solid #222; padding-bottom: 2px;}}
+.metric-grid {{display:grid; grid-template-columns: repeat(4, 1fr); gap: 6px; margin: 8px 0;}}
+.metric-card {{border:1px solid #ccc; padding:6px; border-radius:6px;}}
+.metric-label {{font-size:9px; color:#555; text-transform:uppercase;}}
+.metric-value {{font-size:15px; font-weight:700; margin-top:2px;}}
+.report-table {{width:100%; border-collapse: collapse; font-size: 10px;}}
+.report-table th {{background:#f2f2f2; border:1px solid #bbb; padding:4px; text-align:left;}}
+.report-table td {{border:1px solid #ccc; padding:4px;}}
+.two-col {{display:grid; grid-template-columns: 1fr 1fr; gap: 8px;}}
+.muted {{color:#777; font-style:italic;}}
+.note-box {{border:1px solid #ccc; min-height:45px; padding:6px;}}
+.footer {{margin-top:8px; font-size:9px; color:#777; display:flex; justify-content:space-between;}}
+@media print {{
+  body * {{ visibility: hidden; }}
+  .report-a4, .report-a4 * {{ visibility: visible; }}
+  .report-a4 {{ position: absolute; left: 0; top: 0; width: 190mm; min-height: 277mm; margin:0; border:none; box-shadow:none; padding:10mm; }}
+  @page {{ size: A4; margin: 10mm; }}
+}}
+</style>
+<div class="report-a4">
+  <div class="report-title">MESEČNI IZVEŠTAJ VEŽBAČA</div>
+  <div class="report-subtitle">Vežbač: <b>{name}</b> &nbsp; | &nbsp; Email: {email} &nbsp; | &nbsp; Period: {start_date.strftime('%d.%m.%Y.')} – {end_date.strftime('%d.%m.%Y.')}</div>
+
+  <div class="metric-grid">
+    <div class="metric-card"><div class="metric-label">Broj treninga</div><div class="metric-value">{report.get('training_count',0)}</div></div>
+    <div class="metric-card"><div class="metric-label">Ukupan volumen</div><div class="metric-value">{fmt_num(report.get('total_volume',0))} kg</div></div>
+    <div class="metric-card"><div class="metric-label">Prosek / trening</div><div class="metric-value">{fmt_num(report.get('avg_vol_per_training',0))} kg</div></div>
+    <div class="metric-card"><div class="metric-label">Prosečan RIR</div><div class="metric-value">{avg_rir_text}</div></div>
+  </div>
+
+  <div class="two-col">
+    <div>
+      <div class="report-section-title">Napredak u testovima</div>
+      {progress_html}
+    </div>
+    <div>
+      <div class="report-section-title">Najbolji rezultati u periodu</div>
+      {best_html}
+    </div>
+  </div>
+
+  <div class="report-section-title">Volumen po nedeljama</div>
+  {weekly_html}
+
+  <div class="report-section-title">Komentar trenera</div>
+  <div class="note-box">{note_html}</div>
+
+  <div class="footer"><span>Generisano: {generated}</span><span>Fitnes klub — 5/3/1 + RIR</span></div>
+</div>
+"""
+
+
+def show_admin_report_screen(vezbaci: pd.DataFrame, testovi: pd.DataFrame, dnevnik: pd.DataFrame) -> None:
+    st.subheader("A4 izveštaj vežbača")
+    st.caption("Izaberi vežbača i period. Izveštaj je formatiran da stane na jedan A4 list. Za štampu koristi Ctrl+P ili download HTML fajla.")
+
+    if vezbaci.empty or "Email" not in vezbaci.columns:
+        st.warning("Nema podataka u listu VEZBACI.")
+        return
+    emails = sorted([normalize_email(e) for e in vezbaci["Email"].dropna().tolist() if normalize_email(e)])
+    if not emails:
+        st.warning("Nema email adresa u listu VEZBACI.")
+        return
+
+    c1, c2, c3 = st.columns([2, 1, 1])
+    selected_email = c1.selectbox("Vežbač", emails, key="report_email")
+    today = date.today()
+    default_start = today.replace(day=1)
+    start_date = c2.date_input("Od", value=default_start, key="report_start")
+    end_date = c3.date_input("Do", value=today, key="report_end")
+    trainer_note = st.text_area("Komentar trenera za izveštaj", height=90, placeholder="Upiši kratak komentar koji će se pojaviti na A4 izveštaju.")
+
+    if start_date > end_date:
+        st.error("Datum 'Od' ne može biti posle datuma 'Do'.")
+        return
+
+    report = prepare_user_report(selected_email, start_date, end_date, vezbaci, testovi, dnevnik)
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Treninzi", report["training_count"])
+    m2.metric("Ukupan volumen", f"{fmt_num(report['total_volume'])} kg")
+    m3.metric("Prosek / trening", f"{fmt_num(report['avg_vol_per_training'])} kg")
+    m4.metric("Prosečan RIR", fmt_num(report["avg_rir"], 1) if report["avg_rir"] is not None else "-")
+
+    if report["progress"].empty and report["best_lifts"].empty and report["training_count"] == 0:
+        st.info("Za izabrani period nema dovoljno podataka za izveštaj. Proveri da li postoje unosi u UNOS_TESTOVA i DNEVNIK_UNOS.")
+
+    st.markdown("### Pregled za štampu")
+    html = build_a4_report_html(report, trainer_note)
+    st.components.v1.html(html, height=1120, scrolling=True)
+
+    st.download_button(
+        "Preuzmi A4 izveštaj kao HTML",
+        data=html.encode("utf-8"),
+        file_name=f"izvestaj_{selected_email}_{start_date}_{end_date}.html".replace("@", "_"),
+        mime="text/html",
+        use_container_width=True,
+    )
+
+    with st.expander("Detaljne tabele"):
+        st.write("Napredak u testovima")
+        st.dataframe(report["progress"], use_container_width=True, hide_index=True)
+        st.write("Najbolji rezultati / volumen po vežbi")
+        st.dataframe(report["best_lifts"], use_container_width=True, hide_index=True)
+        st.write("Volumen po nedeljama")
+        st.dataframe(report["weekly"], use_container_width=True, hide_index=True)
+
+
+# ------------------------------------------------------------
+# 9) ADMIN DEO
+# ------------------------------------------------------------
+
+def is_admin_user(user: Dict[str, object]) -> bool:
+    """Admin pristup možeš dati na dva načina:
+    1) u Google Sheets listu VEZBACI dodaj kolonu Uloga=Admin ili Admin=Da
+    2) u Streamlit Secrets dodaj:
+       [admin]
+       emails = "tvoj@email.com, drugi@email.com"
+    """
+    email = normalize_email(user.get("Email"))
+
+    # 1) preko kolona u VEZBACI
+    uloga = normalize_text(user.get("Uloga", "")).lower()
+    admin_flag = normalize_text(user.get("Admin", "")).lower()
+    if uloga in ["admin", "administrator"] or admin_flag in ["da", "yes", "1", "true"]:
+        return True
+
+    # 2) preko Secrets
+    try:
+        admin_cfg = st.secrets.get("admin", {})
+        emails_raw = admin_cfg.get("emails", "") if hasattr(admin_cfg, "get") else ""
+        if isinstance(emails_raw, str):
+            admin_emails = [normalize_email(x) for x in emails_raw.split(",") if normalize_email(x)]
+        else:
+            admin_emails = [normalize_email(x) for x in list(emails_raw)]
+        return email in admin_emails
+    except Exception:
+        return False
+
+
+def _sheet_headers_and_indexes(sheet_name: str) -> Tuple[List[str], Dict[str, int], List[List[str]]]:
+    ws = get_ws(sheet_name)
+    values = ws.get_all_values()
+    header_row = HEADER_ROWS.get(sheet_name, 1)
+    if len(values) < header_row:
+        return [], {}, values
+    headers = [normalize_text(h) for h in values[header_row - 1]]
+    idx = {h: i + 1 for i, h in enumerate(headers) if h}
+    return headers, idx, values
+
+
+def find_row_numbers_by_email(sheet_name: str, email: str) -> List[int]:
+    headers, idx, values = _sheet_headers_and_indexes(sheet_name)
+    if "Email" not in idx:
+        return []
+    email_col_zero = idx["Email"] - 1
+    header_row = HEADER_ROWS.get(sheet_name, 1)
+    target = normalize_email(email)
+    rows = []
+    for sheet_row_number, row in enumerate(values[header_row:], start=header_row + 1):
+        cell = row[email_col_zero] if email_col_zero < len(row) else ""
+        if normalize_email(cell) == target:
+            rows.append(sheet_row_number)
+    return rows
+
+
+def delete_rows_by_email(sheet_name: str, email: str) -> int:
+    ws = get_ws(sheet_name)
+    rows = find_row_numbers_by_email(sheet_name, email)
+    # Brisanje ide od dna da se brojevi redova ne pomere.
+    for r in sorted(rows, reverse=True):
+        ws.delete_rows(r)
+    clear_caches()
+    return len(rows)
+
+
+def update_vezbac_aktivan(email: str, active_value: str) -> bool:
+    ws = get_ws(SHEET_VEZBACI)
+    headers, idx, values = _sheet_headers_and_indexes(SHEET_VEZBACI)
+    if "Email" not in idx or "Aktivan" not in idx:
+        return False
+    rows = find_row_numbers_by_email(SHEET_VEZBACI, email)
+    if not rows:
+        return False
+    for r in rows:
+        ws.update_cell(r, idx["Aktivan"], active_value)
+    clear_caches()
+    return True
+
+
+def mask_sifra(x: Any) -> str:
+    s = normalize_sifra(x)
+    if not s:
+        return ""
+    return "•" * max(4, len(s))
+
+
+def show_admin_screen(user: Dict[str, object]) -> None:
+    if not is_admin_user(user):
+        st.error("Ovaj ekran je dostupan samo administratoru.")
+        return
+
+    st.header("Admin panel")
+    st.caption("Ovde možeš da pregledaš vežbače, blokiraš članarinu i brišeš testove/dnevnik. Za trajnu evidenciju je bolje deaktivirati vežbača nego brisati redove.")
+
+    data = load_core_data()
+    vezbaci = data["vezbaci"].copy()
+    testovi = data["testovi_unos"].copy()
+    dnevnik = data["dnevnik"].copy()
+
+    if vezbaci.empty or "Email" not in vezbaci.columns:
+        st.warning("List VEZBACI je prazan ili nema kolonu Email.")
+        return
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Vežbači", len(vezbaci))
+    c2.metric("Unosi testova", len(testovi))
+    c3.metric("Unosi treninga", len(dnevnik))
+
+    tab_pregled, tab_izvestaj, tab_brisanje = st.tabs(["Pregled i članarina", "A4 izveštaj", "Brisanje podataka"])
+
+    with tab_pregled:
+        st.subheader("Pregled vežbača")
+        show_cols = [c for c in ["ID", "Ime i Prezime", "Email", "Telefon", "Aktivan", "Cilj", "Program_ID", "Uloga", "Sifra"] if c in vezbaci.columns]
+        preview = vezbaci[show_cols].copy() if show_cols else vezbaci.copy()
+        if "Sifra" in preview.columns:
+            preview["Sifra"] = preview["Sifra"].apply(mask_sifra)
+        st.dataframe(preview, use_container_width=True, hide_index=True)
+
+        emails = sorted([normalize_email(e) for e in vezbaci["Email"].dropna().tolist() if normalize_email(e)])
+        if not emails:
+            st.warning("Nema email adresa u listu VEZBACI.")
+            return
+
+        st.subheader("Članarina / aktivacija")
+        selected_email = st.selectbox("Izaberi vežbača", emails, key="admin_status_email")
+        vrow = vezbaci[vezbaci["Email"].apply(normalize_email) == selected_email]
+        current_name = vrow.iloc[0].get("Ime i Prezime", "") if not vrow.empty else ""
+        current_active = vrow.iloc[0].get("Aktivan", "") if not vrow.empty else ""
+        tests_count = len(testovi[testovi["Email"].apply(normalize_email) == selected_email]) if "Email" in testovi.columns else 0
+        logs_count = len(dnevnik[dnevnik["Email"].apply(normalize_email) == selected_email]) if "Email" in dnevnik.columns else 0
+        st.info(f"Izabran: **{current_name}** · {selected_email} · Aktivan: **{current_active}** · Testovi: **{tests_count}** · Unosi treninga: **{logs_count}**")
+
+        a1, a2 = st.columns(2)
+        with a1:
+            if st.button("Blokiraj članarinu — Aktivan = Ne", use_container_width=True):
+                if update_vezbac_aktivan(selected_email, "Ne"):
+                    st.success("Vežbač je blokiran.")
+                    st.rerun()
+                else:
+                    st.error("Nisam uspeo da promenim status.")
+        with a2:
+            if st.button("Aktiviraj članarinu — Aktivan = Da", use_container_width=True):
+                if update_vezbac_aktivan(selected_email, "Da"):
+                    st.success("Vežbač je aktiviran.")
+                    st.rerun()
+                else:
+                    st.error("Nisam uspeo da promenim status.")
+
+    with tab_izvestaj:
+        show_admin_report_screen(vezbaci, testovi, dnevnik)
+
+    with tab_brisanje:
+        emails = sorted([normalize_email(e) for e in vezbaci["Email"].dropna().tolist() if normalize_email(e)])
+        if not emails:
+            st.warning("Nema email adresa u listu VEZBACI.")
+            return
+        st.subheader("Brisanje podataka")
+        st.warning("Brisanje je trajno: redovi se uklanjaju iz Google Sheets-a. Za vežbača koji je prestao da trenira obično je bolje staviti Aktivan = Ne.")
+        selected_email = st.selectbox("Izaberi vežbača za brisanje", emails, key="admin_delete_email")
+        confirm = st.checkbox(f"Potvrđujem da želim da brišem podatke za: {selected_email}")
+        confirm_text = st.text_input("Za potvrdu upiši OBRISI", value="")
+        can_delete = confirm and normalize_text(confirm_text).upper() == "OBRISI"
+
+        d1, d2, d3 = st.columns(3)
+        with d1:
+            if st.button("Obriši samo testove", disabled=not can_delete, use_container_width=True):
+                n = delete_rows_by_email(SHEET_TEST_INPUT, selected_email)
+                st.success(f"Obrisano redova iz UNOS_TESTOVA: {n}")
+                st.rerun()
+        with d2:
+            if st.button("Obriši samo dnevnik", disabled=not can_delete, use_container_width=True):
+                n = delete_rows_by_email(SHEET_DNEVNIK, selected_email)
+                st.success(f"Obrisano redova iz DNEVNIK_UNOS: {n}")
+                st.rerun()
+        with d3:
+            if st.button("Obriši vežbača + sve podatke", disabled=not can_delete, use_container_width=True):
+                n_tests = delete_rows_by_email(SHEET_TEST_INPUT, selected_email)
+                n_logs = delete_rows_by_email(SHEET_DNEVNIK, selected_email)
+                n_user = delete_rows_by_email(SHEET_VEZBACI, selected_email)
+                st.success(f"Obrisano: VEZBACI {n_user}, TESTOVI {n_tests}, DNEVNIK {n_logs}")
+                st.rerun()
+
+
+# ------------------------------------------------------------
+# 10) GLAVNI TOK APLIKACIJE
 # ------------------------------------------------------------
 
 def main() -> None:
@@ -831,7 +1365,10 @@ def main() -> None:
         if st.button("Odjavi se"):
             st.session_state.clear()
             st.rerun()
-        page = st.radio("Izaberi ekran", ["Današnji trening", "Testovi", "Moji podaci"])
+        pages = ["Današnji trening", "Testovi", "Moji podaci"]
+        if is_admin_user(user):
+            pages.append("Admin")
+        page = st.radio("Izaberi ekran", pages)
         if st.button("Osveži podatke"):
             clear_caches()
             st.rerun()
@@ -848,6 +1385,8 @@ def main() -> None:
         show_today_training_screen(user)
     elif page == "Testovi":
         show_initial_tests_screen(user)
+    elif page == "Admin":
+        show_admin_screen(user)
     else:
         st.header("Moji podaci")
         safe_user = {k: v for k, v in user.items() if k not in ["Sifra", "Poruka_Blokada", "__email", "__sifra"]}
@@ -857,4 +1396,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
