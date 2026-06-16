@@ -1,6 +1,6 @@
 # streamlit_app_fitnes_gsheets.py
 # Fitnes klub aplikacija preko Google Sheets baze
-# V6: testiranje svih vežbi + plan + admin panel + A4 izveštaj vežbača
+# V7: V6 + automatska priprema Google Sheets strukture za šablone programa
 
 from __future__ import annotations
 
@@ -25,6 +25,9 @@ SHEET_PODESAVANJA = "PODESAVANJA"
 SHEET_TEST_INPUT = "UNOS_TESTOVA"
 SHEET_DNEVNIK = "DNEVNIK_UNOS"
 SHEET_PLAN = "A4_MESEC_KOMPAKT"
+SHEET_PROGRAM_TEMPLATES = "PROGRAMI_SABLONI"
+SHEET_INDIVIDUAL_CHANGES = "INDIVIDUALNE_IZMENE"
+SHEET_TEMPLATE_HELP = "UPUTSTVO_SABLONI"
 
 HEADER_ROWS = {
     SHEET_VEZBACI: 2,
@@ -32,9 +35,40 @@ HEADER_ROWS = {
     SHEET_TEST_INPUT: 2,
     SHEET_DNEVNIK: 3,
     SHEET_PLAN: 4,
+    SHEET_PROGRAM_TEMPLATES: 1,
+    SHEET_INDIVIDUAL_CHANGES: 1,
+    SHEET_TEMPLATE_HELP: 1,
 }
 
 REQUIRED_VEZBACI_COLS = ["ID", "Ime i Prezime", "Aktivan", "Email", "Sifra", "Poruka_Blokada"]
+
+TEMPLATE_VEZBACI_EXTRA_COLS = ["Uloga", "Program_ID", "Cilj"]
+
+PROGRAM_TEMPLATE_HEADERS = [
+    "Program_ID", "Nedelja", "Trening", "Redosled", "Vezba", "Tip", "Cilj",
+    "Serije", "Ponavljanja", "Procenat", "Plan_RIR", "Napomena"
+]
+
+INDIVIDUAL_CHANGE_HEADERS = ["Email", "Vezba_Original", "Vezba_Zamena", "Razlog", "Aktivno"]
+
+TEMPLATE_HELP_HEADERS = ["Tema", "Uputstvo"]
+
+PROGRAM_TEMPLATE_EXAMPLE_ROWS = [
+    ["PRIMER_ZENE_HIPERTROFIJA_01", 1, 1, 1, "Čučanj", "Glavna", "Snaga", 3, "5/5/5+", "", 2, "Glavna vežba se računa po 5/3/1"],
+    ["PRIMER_ZENE_HIPERTROFIJA_01", 1, 1, 2, "Hip thrust", "Asistencija", "Hipertrofija", 4, "8-12", 70, 2, "Primer asistentske vežbe"],
+    ["PRIMER_ZENE_HIPERTROFIJA_01", 1, 1, 3, "Leg curl", "Asistencija", "Hipertrofija", 3, "10-15", 65, 2, "Primer asistentske vežbe"],
+    ["PRIMER_ZENE_HIPERTROFIJA_01", 1, 2, 1, "Bench press", "Glavna", "Snaga", 3, "5/5/5+", "", 2, "Glavna vežba se računa po 5/3/1"],
+    ["PRIMER_ZENE_HIPERTROFIJA_01", 1, 2, 2, "Lat mašina", "Asistencija", "Hipertrofija", 4, "8-12", 70, 2, "Primer asistentske vežbe"],
+    ["PRIMER_ZENE_HIPERTROFIJA_01", 1, 2, 3, "Potisak bučicama", "Asistencija", "Hipertrofija", 3, "10-12", 65, 2, "Primer asistentske vežbe"],
+]
+
+TEMPLATE_HELP_ROWS = [
+    ["Program_ID", "U listu VEZBACI kod svakog vežbača upiši Program_ID. Aplikacija kasnije može svima sa istim Program_ID da prikaže isti šablon, ali sa njihovim kilažama iz testova."],
+    ["PROGRAMI_SABLONI", "Ovde se program piše jednom: Program_ID, Nedelja, Trening, Redosled, Vezba, Tip, Cilj, Serije, Ponavljanja, Procenat i Plan_RIR."],
+    ["INDIVIDUALNE_IZMENE", "Ovde se unose samo izuzeci: Email, Vezba_Original, Vezba_Zamena, Razlog, Aktivno=Da."],
+    ["Nazivi vežbi", "Naziv vežbe treba da bude isti u BAZA_VEZBI, PROGRAMI_SABLONI, UNOS_TESTOVA i INDIVIDUALNE_IZMENE."],
+    ["Bez brisanja", "Stari listovi ostaju netaknuti. Ovo samo dodaje novu strukturu za budući rad sa šablonima programa."],
+]
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -1157,6 +1191,119 @@ def show_admin_report_screen(vezbaci: pd.DataFrame, testovi: pd.DataFrame, dnevn
         st.dataframe(report["weekly"], use_container_width=True, hide_index=True)
 
 
+
+# ------------------------------------------------------------
+# 8b) AUTOMATSKA PRIPREMA GOOGLE SHEETS STRUKTURE
+# ------------------------------------------------------------
+
+def get_or_create_ws_for_setup(sheet_name: str, rows: int = 200, cols: int = 20):
+    """Vrati worksheet ako postoji, a ako ne postoji napravi ga.
+    Ovo koristimo samo iz Admin panela za pripremu baze.
+    """
+    sh = get_spreadsheet()
+    try:
+        return sh.worksheet(sheet_name), False
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(title=sheet_name, rows=rows, cols=cols)
+        return ws, True
+
+
+def ensure_columns_on_header_row(sheet_name: str, required_cols: List[str]) -> List[str]:
+    """Dodaje kolone koje nedostaju u header red postojećeg lista.
+    Ne briše postojeće kolone i ne pomera podatke.
+    """
+    ws = get_ws(sheet_name)
+    header_row = HEADER_ROWS.get(sheet_name, 1)
+    headers = [normalize_text(h) for h in ws.row_values(header_row)]
+    added = []
+    for col in required_cols:
+        if col not in headers:
+            headers.append(col)
+            ws.update_cell(header_row, len(headers), col)
+            added.append(col)
+    return added
+
+
+def ensure_sheet_with_headers(sheet_name: str, headers: List[str], example_rows: Optional[List[List[Any]]] = None) -> Dict[str, Any]:
+    """Pravi list ako ne postoji i postavlja zaglavlja.
+    Ako list postoji, samo dodaje nedostajuće kolone.
+    Primer redove dodaje samo ako je list nov ili potpuno prazan.
+    """
+    ws, created = get_or_create_ws_for_setup(sheet_name, rows=300, cols=max(20, len(headers) + 3))
+    values = ws.get_all_values()
+    added_cols = []
+    inserted_examples = 0
+
+    if not values or not any(normalize_text(c) for c in values[0]):
+        ws.update("A1", [headers])
+        if example_rows:
+            ws.update(f"A2", example_rows)
+            inserted_examples = len(example_rows)
+    else:
+        current = [normalize_text(h) for h in values[0]]
+        for col in headers:
+            if col not in current:
+                current.append(col)
+                ws.update_cell(1, len(current), col)
+                added_cols.append(col)
+
+    return {"sheet": sheet_name, "created": created, "added_cols": added_cols, "inserted_examples": inserted_examples}
+
+
+def setup_template_database_structure() -> Dict[str, Any]:
+    """Dodaje sve što je potrebno za sistem šablona programa.
+    Bezbedno je pokrenuti više puta: ne duplira postojeće kolone.
+    """
+    result = {"vezbaci_added": [], "sheets": []}
+    result["vezbaci_added"] = ensure_columns_on_header_row(SHEET_VEZBACI, TEMPLATE_VEZBACI_EXTRA_COLS)
+    result["sheets"].append(ensure_sheet_with_headers(SHEET_PROGRAM_TEMPLATES, PROGRAM_TEMPLATE_HEADERS, PROGRAM_TEMPLATE_EXAMPLE_ROWS))
+    result["sheets"].append(ensure_sheet_with_headers(SHEET_INDIVIDUAL_CHANGES, INDIVIDUAL_CHANGE_HEADERS, []))
+    result["sheets"].append(ensure_sheet_with_headers(SHEET_TEMPLATE_HELP, TEMPLATE_HELP_HEADERS, TEMPLATE_HELP_ROWS))
+    clear_caches()
+    return result
+
+
+def show_database_setup_admin_tab() -> None:
+    st.subheader("Podešavanje baze za šablone programa")
+    st.write(
+        "Ova opcija automatski priprema Google Sheets za sistem: "
+        "VEZBACI → Program_ID → PROGRAMI_SABLONI → INDIVIDUALNE_IZMENE. "
+        "Postojeći podaci se ne brišu. Dodaju se samo kolone i novi listovi ako nedostaju."
+    )
+    st.warning("Pokreni ovo jednom. Bezbedno je i ako se pokrene ponovo, jer ne duplira postojeće kolone.")
+
+    if st.button("Pripremi Google Sheets strukturu", type="primary", use_container_width=True):
+        try:
+            result = setup_template_database_structure()
+            st.success("Google Sheets struktura je pripremljena.")
+            if result["vezbaci_added"]:
+                st.write("Dodate kolone u VEZBACI:", ", ".join(result["vezbaci_added"]))
+            else:
+                st.write("VEZBACI već ima potrebne kolone: Uloga, Program_ID, Cilj.")
+            for item in result["sheets"]:
+                status = "napravljen" if item["created"] else "već postoji"
+                st.write(f"List **{item['sheet']}**: {status}.")
+                if item["added_cols"]:
+                    st.write("Dodate kolone:", ", ".join(item["added_cols"]))
+                if item["inserted_examples"]:
+                    st.write(f"Dodato primera redova: {item['inserted_examples']}")
+            st.info("Sada u VEZBACI kod vežbača možeš da upišeš Program_ID, npr. PRIMER_ZENE_HIPERTROFIJA_01 ili svoj naziv programa.")
+        except Exception as e:
+            st.error("Nisam uspeo da pripremim strukturu.")
+            st.exception(e)
+
+    with st.expander("Koji listovi i kolone se dodaju?"):
+        st.markdown("""
+        **VEZBACI** — dodaju se kolone: `Uloga`, `Program_ID`, `Cilj`  
+        **PROGRAMI_SABLONI** — osnovni šabloni programa  
+        **INDIVIDUALNE_IZMENE** — zamene vežbi za pojedinačnog vežbača  
+        **UPUTSTVO_SABLONI** — kratko uputstvo u samom Google Sheets fajlu
+        """)
+        st.write("Zaglavlje PROGRAMI_SABLONI:")
+        st.code(" | ".join(PROGRAM_TEMPLATE_HEADERS))
+        st.write("Zaglavlje INDIVIDUALNE_IZMENE:")
+        st.code(" | ".join(INDIVIDUAL_CHANGE_HEADERS))
+
 # ------------------------------------------------------------
 # 9) ADMIN DEO
 # ------------------------------------------------------------
@@ -1268,7 +1415,7 @@ def show_admin_screen(user: Dict[str, object]) -> None:
     c2.metric("Unosi testova", len(testovi))
     c3.metric("Unosi treninga", len(dnevnik))
 
-    tab_pregled, tab_izvestaj, tab_brisanje = st.tabs(["Pregled i članarina", "A4 izveštaj", "Brisanje podataka"])
+    tab_pregled, tab_izvestaj, tab_podesavanje, tab_brisanje = st.tabs(["Pregled i članarina", "A4 izveštaj", "Podešavanje baze", "Brisanje podataka"])
 
     with tab_pregled:
         st.subheader("Pregled vežbača")
@@ -1310,6 +1457,9 @@ def show_admin_screen(user: Dict[str, object]) -> None:
 
     with tab_izvestaj:
         show_admin_report_screen(vezbaci, testovi, dnevnik)
+
+    with tab_podesavanje:
+        show_database_setup_admin_tab()
 
     with tab_brisanje:
         emails = sorted([normalize_email(e) for e in vezbaci["Email"].dropna().tolist() if normalize_email(e)])
